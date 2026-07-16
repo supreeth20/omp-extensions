@@ -49,7 +49,7 @@ class RecordingApi {
   async exec(...arguments_: unknown[]): Promise<Record<string, unknown>> {
     this.execCalls.push(arguments_);
     this.hostRuns += 1;
-    return { exitCode: 0, stdout: "host" };
+    return { code: 0, stdout: "host", stderr: "", killed: false };
   }
 }
 
@@ -354,8 +354,8 @@ describe("production extension enforcement regressions", () => {
     expect(result).toMatchObject({ exitCode: 0, stdout: "host" });
     expect(api.hostRuns).toBe(1);
     expect(api.execCalls).toHaveLength(1);
-    expect(api.execCalls[0]?.[0]).toBe("C:\\Program Files\\PowerShell\\7\\pwsh.exe");
-    expect(api.execCalls[0]?.[1]).toEqual(["-NoLogo", "-NoProfile", "-Command", "Write-Output 'safe'"]);
+    expect(String(api.execCalls[0]?.[0])).toMatch(/[\\/]pwsh\.exe$/i);
+    expect(api.execCalls[0]?.[1]).toEqual(["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command", "Write-Output 'safe'"]);
     const failureResult = await powershell.execute({
       command: "Write-Output 'after failure'",
       cwd: "C:\\repo",
@@ -367,8 +367,306 @@ describe("production extension enforcement regressions", () => {
     expect(failureResult).toMatchObject({ exitCode: 0, outsideSandbox: true, launchFailed: true });
     expect(api.hostRuns).toBe(2);
     expect(api.execCalls).toHaveLength(2);
-    expect(api.execCalls[1]?.[0]).toBe("C:\\Program Files\\PowerShell\\7\\pwsh.exe");
-    expect(api.execCalls[1]?.[1]).toEqual(["-NoLogo", "-NoProfile", "-Command", "Write-Output 'after failure'"]);
+    expect(String(api.execCalls[1]?.[0])).toMatch(/[\\/]pwsh\.exe$/i);
+    expect(api.execCalls[1]?.[1]).toEqual(["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command", "Write-Output 'after failure'"]);
+  });
+
+  test("PowerShell outside-once renders stderr instead of result JSON", async () => {
+    const mod = await loadContract("extension");
+    const factory = requiredExport<ExtensionFactory>(mod, "default");
+    const api = new RecordingApi();
+    api.exec = async () => ({ code: 1, stdout: "", stderr: "fatal: not a git repository\n", killed: false });
+    await factory(api, { ...successfulRestoreDependencies, platform: "win32" });
+    const context = enabledLifecycleContext([
+      { type: "custom", customType: "mxc-sandbox/state", data: { version: 1, enabled: true, filesystem: { read: [], write: [] } } },
+    ], { ui: { confirm: async () => true } });
+    await api.handlers.get("session_start")?.[0]?.({}, context);
+    const powershell = api.tools.get("powershell") as Record<string, any>;
+    const result = await powershell.execute("CALL", {
+      outsideSandbox: true,
+      command: "git status --short",
+      cwd: "C:\\repo",
+    }, undefined, undefined, context);
+    expect(result).toMatchObject({
+      content: [{ type: "text", text: "fatal: not a git repository\n" }],
+      details: { exitCode: 1, stderr: "fatal: not a git repository\n" },
+      isError: true,
+    });
+    expect(result.content[0].text).not.toContain('"stderr"');
+  });
+
+  test("PowerShell outside-once streams before host completion", async () => {
+    const mod = await loadContract("extension");
+    const factory = requiredExport<ExtensionFactory>(mod, "default");
+    const api = new RecordingApi();
+    const release = Promise.withResolvers<void>();
+    await factory(api, {
+      ...successfulRestoreDependencies,
+      platform: "win32",
+      spawnHost: async (_executable: string, _arguments: string[], _input: Record<string, unknown>, onUpdate: (update: Record<string, unknown>) => void) => {
+        onUpdate({ stream: "stdout", data: "outside first\n" });
+        await release.promise;
+        await Bun.sleep(110);
+        onUpdate({ stream: "stderr", data: "outside second\n" });
+        return { stdout: "outside first\n", stderr: "outside second\n", exitCode: 0 };
+      },
+    });
+    const context = enabledLifecycleContext([
+      { type: "custom", customType: "mxc-sandbox/state", data: { version: 1, enabled: true, filesystem: { read: [], write: [] } } },
+    ], { ui: { confirm: async () => true } });
+    await api.handlers.get("session_start")?.[0]?.({}, context);
+    const powershell = api.tools.get("powershell") as Record<string, any>;
+    const updates: Record<string, any>[] = [];
+    const firstUpdate = Promise.withResolvers<void>();
+    const execution = powershell.execute("CALL", {
+      outsideSandbox: true,
+      command: "Write-Output 'outside first'",
+      cwd: "C:\\repo",
+    }, undefined, (update: Record<string, any>) => {
+      updates.push(update);
+      firstUpdate.resolve();
+    }, context);
+    await firstUpdate.promise;
+    expect(updates).toEqual([{ content: [{ type: "text", text: "outside first\n" }], details: undefined }]);
+    expect(api.execCalls).toHaveLength(0);
+    release.resolve();
+    await expect(execution).resolves.toMatchObject({
+      content: [{ type: "text", text: "outside first\noutside second\n" }],
+      details: { exitCode: 0 },
+      isError: false,
+    });
+    expect(updates.at(-1)).toEqual({ content: [{ type: "text", text: "outside first\noutside second\n" }], details: undefined });
+  });
+
+  test("Bash outside-once streams before host completion on macOS and Linux", async () => {
+    const mod = await loadContract("extension");
+    const factory = requiredExport<ExtensionFactory>(mod, "default");
+    for (const platform of ["darwin", "linux"] as const) {
+      const api = new RecordingApi();
+      const release = Promise.withResolvers<void>();
+      await factory(api, {
+        ...successfulRestoreDependencies,
+        platform,
+        spawnHost: async (_executable: string, _arguments: string[], _input: Record<string, unknown>, onUpdate: (update: Record<string, unknown>) => void) => {
+          onUpdate({ stream: "stdout", data: "outside first\n" });
+          await release.promise;
+          onUpdate({ stream: "stderr", data: "outside second\n" });
+          return { stdout: "outside first\n", stderr: "outside second\n", exitCode: 0 };
+        },
+      });
+      const context = enabledLifecycleContext([
+        { type: "custom", customType: "mxc-sandbox/state", data: { version: 1, enabled: true, filesystem: { read: [], write: [] } } },
+      ], { configuredShell: "/bin/zsh", ui: { confirm: async () => true } });
+      await api.handlers.get("session_start")?.[0]?.({}, context);
+      const bash = api.tools.get("bash") as Record<string, any>;
+      const updates: Record<string, any>[] = [];
+      const firstUpdate = Promise.withResolvers<void>();
+      const execution = bash.execute("CALL", {
+        outsideSandbox: true,
+        command: "printf 'outside first'",
+        cwd: "/repo",
+      }, undefined, (update: Record<string, any>) => {
+        updates.push(update);
+        firstUpdate.resolve();
+      }, context);
+      await firstUpdate.promise;
+      expect(updates).toEqual([{ content: [{ type: "text", text: "outside first\n" }], details: {} }]);
+      expect(api.execCalls).toHaveLength(0);
+      release.resolve();
+      await expect(execution).resolves.toMatchObject({
+        content: [{ type: "text", text: "outside first\noutside second\n" }],
+        details: { exitCode: 0 },
+      });
+      expect(updates.at(-1)).toEqual({ content: [{ type: "text", text: "outside first\noutside second\n" }], details: {} });
+    }
+  });
+
+  test("PowerShell uses OMP shell rendering for pending, partial, and completed states", async () => {
+    const mod = await loadContract("extension");
+    const factory = requiredExport<ExtensionFactory>(mod, "default");
+    const api = new RecordingApi();
+    const rendererCalls: { args: Record<string, unknown>; options: Record<string, unknown> }[] = [];
+    const renderResult = () => ({ render: () => [] });
+    const renderCall = (args: Record<string, unknown>, options: Record<string, unknown>) => {
+      rendererCalls.push({ args, options });
+      return { render: () => ["pending"] };
+    };
+    let rendererFactoryCalls = 0;
+    let rendererConfig: Record<string, any> | undefined;
+    (api as unknown as Record<string, unknown>).pi = {
+      bashToolRenderer: { renderCall: () => ({ render: () => ["bash-fallback"] }), renderResult, mergeCallAndResult: true, inline: true },
+      createShellRenderer: (config: Record<string, any>) => {
+        rendererFactoryCalls += 1;
+        rendererConfig = config;
+        return { renderCall, renderResult, mergeCallAndResult: true, inline: true };
+      },
+    };
+    await factory(api, { ...successfulRestoreDependencies, platform: "win32" });
+    const context = enabledLifecycleContext([
+      { type: "custom", customType: "mxc-sandbox/state", data: { version: 1, enabled: true, filesystem: { read: [], write: [] } } },
+    ]);
+    await api.handlers.get("session_start")?.[0]?.({}, context);
+    const powershell = api.tools.get("powershell") as Record<string, any>;
+    expect(rendererFactoryCalls).toBe(1);
+    expect(rendererConfig?.resolveTitle()).toBe("PowerShell");
+    expect(rendererConfig?.showHeader).toBe(true);
+    expect(rendererConfig?.resolveCommand({ command: "Get-Location" })).toBe("Get-Location");
+    expect(powershell.renderResult).toBe(renderResult);
+    expect(powershell).toMatchObject({ mergeCallAndResult: true, inline: true });
+    const pendingOptions = { isPartial: true, spinnerFrame: 3 };
+    powershell.renderCall({ command: "Get-Location", cwd: "C:\\repo" }, pendingOptions, {});
+    powershell.renderCall({ outsideSandbox: true, command: "git status", cwd: "C:\\repo" }, pendingOptions, {});
+    expect(rendererCalls).toEqual([
+      { args: { command: "Get-Location", cwd: "C:\\repo" }, options: pendingOptions },
+      { args: { outsideSandbox: true, command: "git status", cwd: "C:\\repo" }, options: pendingOptions },
+    ]);
+
+    const updates: Record<string, any>[] = [];
+    const firstUpdate = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const execution = powershell.execute("CALL", {
+      command: "Write-Output 'first'; Write-Error 'second'; Write-Output 'third'",
+      timeout: 3,
+      spawn: async (config: Record<string, any>, events: Record<string, (data: string) => void>) => {
+        const payload = String(config.process.commandLine.at(-1));
+        const bootstrap = Buffer.from(payload.split(" -EncodedCommand ").at(-1) ?? "", "base64").toString("utf16le");
+        const marker = bootstrap.match(/__OMP_MXC_READY_[A-Za-z0-9_-]+__/)?.[0];
+        expect(marker).toBeDefined();
+        events.stderr!(`${marker}\r\n`);
+        events.stdout!("first\n");
+        await release.promise;
+        events.stderr!("second\n");
+        events.stdout!("third\n");
+        return { exitCode: 7 };
+      },
+    }, undefined, (update: Record<string, any>) => {
+      updates.push(update);
+      if (updates.length === 1) firstUpdate.resolve();
+    }, context);
+    await firstUpdate.promise;
+    expect(updates).toHaveLength(1);
+    release.resolve();
+    const result = await execution;
+    expect(updates).toHaveLength(2);
+    expect(updates[0]).toEqual({ content: [{ type: "text", text: "" }], details: undefined });
+    expect(updates[1]).toEqual({ content: [{ type: "text", text: "first\n" }], details: undefined });
+    expect(result).toMatchObject({
+      content: [{ type: "text", text: "first\nsecond\nthird\n" }],
+      details: { exitCode: 7, stdout: "first\nthird\n", stderr: "second\n", timeoutSeconds: 3, wallTimeMs: expect.any(Number) },
+      isError: true,
+    });
+  });
+
+  test("PowerShell 7 works immediately while sandboxing remains disabled", async () => {
+    const mod = await loadContract("extension");
+    const factory = requiredExport<ExtensionFactory>(mod, "default");
+    const api = new RecordingApi();
+    await factory(api, { platform: "win32" });
+    const powershell = api.tools.get("powershell") as Record<string, any>;
+    expect(powershell).toBeDefined();
+    const result = await powershell.execute("CALL", { command: "$PSVersionTable.PSVersion.Major", timeout: 12 }, undefined, undefined, {
+      discoveredExecutables: ["C:\\Program Files\\PowerShell\\7\\pwsh.exe"],
+    });
+    expect(result).toMatchObject({
+      content: [{ type: "text", text: "host" }],
+      details: { exitCode: 0, stdout: "host", timeoutSeconds: 12, requestedTimeoutSeconds: 12 },
+      isError: false,
+    });
+    expect(String(api.execCalls[0]?.[0])).toMatch(/[\\/]pwsh\.exe$/i);
+    expect(api.execCalls[0]?.[1]).toEqual(["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command", "$PSVersionTable.PSVersion.Major"]);
+    expect(api.execCalls[0]?.[2]).toEqual({ cwd: undefined, env: undefined, timeout: 12_000 });
+  });
+
+  test("disabled PowerShell streams one cumulative result before host completion", async () => {
+    const mod = await loadContract("extension");
+    const factory = requiredExport<ExtensionFactory>(mod, "default");
+    const api = new RecordingApi();
+    const release = Promise.withResolvers<void>();
+    await factory(api, {
+      platform: "win32",
+      spawnHost: async (_executable: string, _arguments: string[], _input: Record<string, unknown>, onUpdate: (update: Record<string, unknown>) => void) => {
+        onUpdate({ stream: "stdout", data: "first\n" });
+        await release.promise;
+        await Bun.sleep(110);
+        onUpdate({ stream: "stderr", data: "second\n" });
+        return { stdout: "first\n", stderr: "second\n", exitCode: 0 };
+      },
+    });
+    const powershell = api.tools.get("powershell") as Record<string, any>;
+    const updates: Record<string, any>[] = [];
+    const firstUpdate = Promise.withResolvers<void>();
+    const execution = powershell.execute("CALL", { command: "Write-Output first" }, undefined, (update: Record<string, any>) => {
+      updates.push(update);
+      firstUpdate.resolve();
+    }, { discoveredExecutables: ["C:\\Program Files\\PowerShell\\7\\pwsh.exe"] });
+    await firstUpdate.promise;
+    expect(updates).toEqual([{ content: [{ type: "text", text: "first\n" }], details: undefined }]);
+    expect(api.execCalls).toHaveLength(0);
+    release.resolve();
+    await expect(execution).resolves.toMatchObject({
+      content: [{ type: "text", text: "first\nsecond\n" }],
+      details: { exitCode: 0 },
+      isError: false,
+    });
+    expect(updates.at(-1)).toEqual({ content: [{ type: "text", text: "first\nsecond\n" }], details: undefined });
+  });
+
+  test("disabled host Bash returns normal rendered results on macOS and Linux", async () => {
+    const mod = await loadContract("extension");
+    const factory = requiredExport<ExtensionFactory>(mod, "default");
+    for (const platform of ["darwin", "linux"] as const) {
+      const api = new RecordingApi();
+      await factory(api, { platform });
+      const bash = api.tools.get("bash") as Record<string, any>;
+      const result = await bash.execute("CALL", { command: "printf ok", timeout: 2.5 }, undefined, undefined, { configuredShell: "/bin/zsh" });
+      expect(result).toMatchObject({
+        content: [{ type: "text", text: "host" }],
+        details: { code: 0, stdout: "host", stderr: "", killed: false },
+      });
+      expect(api.execCalls).toEqual([["/bin/zsh", ["-lc", "printf ok"], { cwd: undefined, env: undefined, timeout: 2.5 }]]);
+    }
+  });
+
+  test("macOS and Linux activation stays stable while contained Bash uses normal streaming updates", async () => {
+    const mod = await loadContract("extension");
+    const factory = requiredExport<ExtensionFactory>(mod, "default");
+    for (const platform of ["darwin", "linux"] as const) {
+      const api = new RecordingApi();
+      let probeInput: Record<string, any> | undefined;
+      await factory(api, {
+        ...successfulRestoreDependencies,
+        platform,
+        probeMxcExecution: async (input: Record<string, any>) => {
+          probeInput = input;
+          return { contained: true, backend: platform === "darwin" ? "seatbelt" : "bubblewrap", platformCapabilities: { independentLocalNetwork: true } };
+        },
+      });
+      const context = enabledLifecycleContext([
+        { type: "custom", customType: "mxc-sandbox/state", data: { version: 1, enabled: true, filesystem: { read: [], write: [] }, network: { internet: false, localNetwork: false } } },
+      ], { configuredShell: "/bin/zsh" });
+      await api.handlers.get("session_start")?.[0]?.({}, context);
+      expect(probeInput).toMatchObject({
+        platform,
+        shell: { executable: "/bin/zsh", args: ["-lc"], dialect: "posix" },
+        env: { PATH: process.env.PATH ?? "" },
+      });
+      expect(Object.keys(probeInput?.env ?? {})).toEqual(["PATH"]);
+      expect(probeInput).not.toHaveProperty("containerId");
+      expect(probeInput).not.toHaveProperty("trafficShell");
+      expect(probeInput).not.toHaveProperty("requiredReadonlyPaths");
+
+      const updates: Record<string, unknown>[] = [];
+      const bash = api.tools.get("bash") as Record<string, any>;
+      const result = await bash.execute("CALL", {
+        command: "printf ok",
+        spawn: async (_config: unknown, events: Record<string, (data: string) => void>) => {
+          events.stdout!("first\n");
+          return { exitCode: 0 };
+        },
+      }, undefined, (update: Record<string, unknown>) => updates.push(update), context);
+      expect(updates).toEqual([{ content: [{ type: "text", text: "first\n" }], details: {} }]);
+      expect(result).toMatchObject({ details: { exitCode: 0, stdout: "first\n" } });
+    }
   });
 
   test("production dispatcher passes effective network and host lists to all host adapters", async () => {
@@ -491,75 +789,6 @@ describe("production extension enforcement regressions", () => {
     expect(await commandApi.handlers.get("tool_call")?.[0]?.({ source: "model", toolName: "web_search", input: { query: "command-approved" } }, {})).toBeUndefined();
   });
 
-  test("sandbox_run validates, expands, applies, and selectively persists capabilities atomically", async () => {
-    const mod = await loadContract("extension");
-    const factory = requiredExport<ExtensionFactory>(mod, "default");
-    const api = new RecordingApi();
-    await factory(api, { ...successfulRestoreDependencies, platform: "linux", probeMxcExecution: async () => ({ contained: true, backend: "bubblewrap", platformCapabilities: { allowedHosts: true, blockedHosts: true, independentLocalNetwork: true } }) });
-    const entries = [{ type: "custom", customType: "mxc-sandbox/state", data: { version: 1, enabled: true, filesystem: { read: [], write: [] }, network: { internet: false, localNetwork: false }, ui: { allowWindows: true, clipboardRead: false, clipboardWrite: false, inputInjection: false } } }];
-    const context = enabledLifecycleContext(entries);
-    await api.handlers.get("session_start")?.[0]?.({}, context);
-    const tool = api.tools.get("sandbox_run") as Record<string, any>;
-    expect(tool.parameters.properties.capabilities).toMatchObject({ type: "array" });
-    const prompts: string[] = [];
-    let config: Record<string, any> | undefined;
-    const secretName = `MXC_ATOMIC_SECRET_${crypto.randomUUID().replaceAll("-", "_")}`;
-    process.env[secretName] = "approved-value";
-    try {
-      const result = await tool.execute({
-        shell: "bash", command: "cat /approved/tree/a", spawn: async (value: Record<string, any>) => { config = value; return { exitCode: 0, stdout: "ok" }; },
-        capabilities: [
-          { capability: "read", value: "/approved/tree", recursive: true, scope: "conversation" },
-          { capability: "internet", value: "allow", scope: "conversation" },
-          { capability: "sensitive-environment-name", value: secretName, scope: "once" },
-          { capability: "ui", value: "clipboardRead", scope: "once" },
-          { capability: "trusted-tool", value: "vendor.atomic", scope: "conversation" },
-        ],
-      }, { ...context, ui: { select: async (title: string) => { prompts.push(title); return title.startsWith("Approve atomic sandbox run?") ? "allow-conversation" : "Omit all"; } } });
-      expect(result).toMatchObject({ exitCode: 0, stdout: "ok" });
-      expect(prompts.some((title) => title.includes("cat /approved/tree/a"))).toBe(true);
-      expect(prompts.some((title) => title.includes("exactPolicy"))).toBe(true);
-      expect(config?.policy).toMatchObject({ filesystem: { read: [expect.objectContaining({ path: "/approved/tree", kind: "directory", recursive: true })] }, network: { internet: true, unrestricted: true }, ui: { clipboardRead: true } });
-      expect(config?.process.env[secretName]).toBe("approved-value");
-      const saved = (api.entries.at(-1) as Record<string, any>).data;
-      expect(saved).toMatchObject({ filesystem: { read: [expect.objectContaining({ path: "/approved/tree", recursive: true })] }, network: { internet: true, unrestricted: true }, trustedTools: ["vendor.atomic"] });
-      expect(saved.ui.clipboardRead).toBe(false);
-      expect(JSON.stringify(saved)).not.toContain(secretName);
-    } finally {
-      delete process.env[secretName];
-    }
-    await expect(tool.execute({ command: "echo no", capabilities: [{ capability: "read", value: "/x", scope: "project" }] }, context)).rejects.toMatchObject({ code: "INVALID_SANDBOX_CAPABILITY_SCOPE" });
-  });
-
-  test("headless sandbox_run parent prompt identifies the child and includes the full exact expansion", async () => {
-    const mod = await loadContract("extension");
-    const factory = requiredExport<ExtensionFactory>(mod, "default");
-    const api = new RecordingApi();
-    await factory(api, successfulRestoreDependencies);
-    const prompts: string[] = [];
-    const parent = enabledLifecycleContext([
-      { type: "custom", customType: "mxc-sandbox/state", data: { version: 1, enabled: true, filesystem: { read: [], write: [] } } },
-    ], { sessionTreeId: "ATOMIC-CHILD-TREE", ui: { select: async (title: string) => { prompts.push(title); return "allow-once"; } } });
-    await api.handlers.get("session_start")?.[0]?.({}, parent);
-    const scopedManager = {};
-    const sessionManager = { getSessionId: () => "ATOMIC-CHILD-SESSION", getSessionTreeId: () => "ATOMIC-CHILD-TREE", allocateArtifactPath: parent.sessionManager.allocateArtifactPath };
-    const child = { agentId: "atomic-child-agent", sessionTreeId: "ATOMIC-CHILD-TREE", sessionManager, scopedManager, liveMatches: [{ live: true, sessionId: "ATOMIC-CHILD-SESSION", agentId: "atomic-child-agent", scopedManager }], configuredShell: "/bin/zsh", hasUI: false };
-    const command = "printf '%s' 'full child command'";
-    const exactTarget = "/approved/exact-child-file";
-    const result = await (api.tools.get("sandbox_run") as Record<string, any>).execute({
-      command,
-      cwd: "/approved/exact-cwd",
-      capabilities: [{ capability: "read", value: exactTarget, scope: "once" }],
-      spawn: async () => ({ exitCode: 0, stdout: "child-ok" }),
-    }, child);
-    expect(result).toMatchObject({ exitCode: 0, stdout: "child-ok" });
-    expect(prompts).toHaveLength(1);
-    expect(prompts[0]).toContain("atomic-child-agent");
-    expect(prompts[0]).toContain(command);
-    expect(prompts[0]).toContain("capabilityExpansion");
-    expect(prompts[0]).toContain("exactPolicy");
-    expect(prompts[0]).toContain(exactTarget);
-  });
 
   test("factory passes structurally configured auto-background threshold to shell execution", async () => {
     const mod = await loadContract("extension");
@@ -612,6 +841,23 @@ describe("production extension enforcement regressions", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  test("Windows dashboard enables internet while preserving proven local-network isolation", async () => {
+    const mod = await loadContract("extension");
+    const factory = requiredExport<ExtensionFactory>(mod, "default");
+    const api = new RecordingApi();
+    await factory(api, {
+      ...successfulRestoreDependencies,
+      platform: "win32",
+      probeMxcExecution: async () => ({ contained: true, backend: "processcontainer", platformCapabilities: { internetLocalNetworkIsolation: true, localNetworkAvailable: false, independentLocalNetwork: false } }),
+    });
+    await api.handlers.get("session_start")?.[0]?.({}, enabledLifecycleContext([
+      { type: "custom", customType: "mxc-sandbox/state", data: { version: 1, enabled: true, filesystem: { read: [], write: [] }, network: { internet: false, localNetwork: false } } },
+    ]));
+    const choices = ["Network", "Internet", "Enable", "Apply"];
+    await (api.commands.get("sandbox") as Record<string, any>).handler("", { hasUI: true, ui: { select: async () => choices.shift() } });
+    expect((api.entries.at(-1) as Record<string, any>).data.network).toMatchObject({ internet: true, localNetwork: false, unrestricted: true });
   });
 
   test("production Windows factory wires approved compatibility and critical PowerShell gates", async () => {
@@ -687,6 +933,7 @@ describe("production extension enforcement regressions", () => {
     const factory = requiredExport<ExtensionFactory>(mod, "default");
     const api = new RecordingApi();
     const calls: string[] = [];
+    let observedProbeInput: Record<string, any> | undefined;
     await factory(api, {
       platform: "win32",
       loadMxc: async () => ({
@@ -695,6 +942,7 @@ describe("production extension enforcement regressions", () => {
         reprobePlatformSupport: () => ({ isolationTier: "appcontainer-dacl", isolationWarnings: ["BaseContainer unavailable; selected DACL compatibility"], isSupported: true }),
       }),
       probeMxcExecution: async (input: Record<string, any>) => {
+        observedProbeInput = input;
         calls.push(`probe:${input.policy.mxcOverrides.fallback.allowDaclMutation}`);
         return { contained: true, backend: "processcontainer", readonlyPathDiscoveryAttested: true, requiredReadonlyPaths: ["C:\\mxc\\bin", "C:\\runtime"], platformCapabilities: { windowsBuild: 26100, tier: "appcontainer-dacl", nativeEnforcementAvailable: false } };
       },
@@ -715,6 +963,14 @@ describe("production extension enforcement regressions", () => {
     });
     await (api.commands.get("sandbox") as Record<string, any>).handler("enable", context);
     expect(calls).toEqual(["select-compatibility", "probe:true"]);
+    expect(observedProbeInput).toMatchObject({
+      platform: "win32",
+      shell: { executable: "C:\\Windows\\System32\\cmd.exe", args: ["/d", "/s", "/c"], dialect: "cmd" },
+      policy: { filesystem: { read: [{ path: "C:\\workspace", kind: "directory", recursive: true }, { path: "C:\\Windows\\System32", kind: "directory", recursive: true }] } },
+    });
+    expect(observedProbeInput?.containerId).toMatch(/^mxc-/);
+    expect(observedProbeInput?.env.SystemRoot).toBe(process.env.SystemRoot);
+    expect(observedProbeInput?.requiredReadonlyPaths).toContain("C:\\Program Files\\Git\\bin");
     const saved = (api.entries.at(-1) as Record<string, any>).data;
     expect(saved.mxcOverrides.fallback.allowDaclMutation).toBe(true);
     expect(saved.filesystem.read).toEqual([{ path: "C:\\workspace", recursive: true }]);
@@ -1308,6 +1564,7 @@ describe("disabled-by-default extension loading", () => {
     await factory(api);
     expect(api.commands.has("sandbox")).toBe(true);
     expect([...api.commands.keys()]).toEqual(["sandbox"]);
+    expect(api.tools.has("sandbox_run")).toBe(false);
     expect(before).toEqual({ spawned: 0, installed: 0, mxcLoaded: 0 });
     expect(api.entries).toEqual([]);
     delete (globalThis as Record<string, unknown>).__MXC_SANDBOX_TEST_OBSERVER__;
@@ -1320,8 +1577,9 @@ describe("disabled-by-default extension loading", () => {
     await factory(api);
     const bash = api.tools.get("bash") as { execute(input: Record<string, unknown>, context: Record<string, unknown>): Promise<unknown> };
     expect(bash).toBeDefined();
-    await expect(bash.execute({ command: "printf ok", cwd: "/tmp", pty: false }, {})).resolves.toEqual({ exitCode: 0, stdout: "host" });
-    expect(api.execCalls[0]?.[0]).toBe(process.env.SHELL ?? "/bin/bash");
+    await expect(bash.execute({ command: "printf ok", cwd: "/tmp", pty: false }, {})).resolves.toEqual({ code: 0, stdout: "host", stderr: "", killed: false });
+    if (process.platform === "win32") expect(String(api.execCalls[0]?.[0])).toMatch(/[\\/]bash\.exe$/i);
+    else expect(api.execCalls[0]?.[0]).toBe(process.env.SHELL ?? "/bin/bash");
     expect(api.execCalls[0]?.[1]).toEqual(["-lc", "printf ok"]);
   });
 
@@ -1548,13 +1806,15 @@ describe("tool interception and escape flows", () => {
     const outside = requiredExport<OutsideOnce>(mod, "executeOutsideOnce");
     const displayed: Record<string, unknown>[] = [];
     const hostEnvironment = { PATH: "/bin", API_TOKEN: "secret" };
-    const input = { callId: "C1", outsideSandbox: true, command: "tool --arg", cwd: "/repo", agentId: "child", hostEnvironment };
+    const input = { callId: "C1", outsideSandbox: true, command: "tool --arg", cwd: "/repo", agentId: "child", hostEnvironment, timeout: 2.5 };
+    let hostInput: Record<string, unknown> | undefined;
     expect(await outside({
       ...input,
       approve: async (details: Record<string, unknown>) => { displayed.push(details); return true; },
-      executeHost: async (details: Record<string, unknown>) => ({ details, exitCode: 0 }),
+      executeHost: async (details: Record<string, unknown>) => { hostInput = details; return { details, exitCode: 0 }; },
     })).toMatchObject({ exitCode: 0 });
     expect(displayed).toEqual([{ callId: "C1", command: "tool --arg", cwd: "/repo", requestingAgent: "child", scope: "exact-call-once" }]);
+    expect(hostInput).toMatchObject({ command: "tool --arg", cwd: "/repo", env: hostEnvironment, timeout: 2.5 });
     await expectAsyncFailureCode(() => outside({ ...input, callId: "C2", approve: async () => false }), "OUTSIDE_EXECUTION_DECLINED");
   });
 

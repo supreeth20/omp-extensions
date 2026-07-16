@@ -4,13 +4,11 @@ export type PermissionResult = Record<string, unknown>;
 type Prompt = (request: PermissionRequest) => Promise<PermissionResult>;
 type ResolveParent = (request: PermissionRequest) => unknown;
 type PromptParent = (parent: unknown, request: PermissionRequest) => Promise<PermissionResult>;
-type ExecuteSandboxed = (request: PermissionRequest, decision?: "allow-once" | "allow-conversation") => Promise<PermissionResult>;
 
 interface BrokerOptions {
   prompt?: Prompt;
   resolveParent?: ResolveParent;
   promptParent?: PromptParent;
-  executeSandboxed?: ExecuteSandboxed;
   sessionTreeId?: string;
 }
 
@@ -131,24 +129,4 @@ export class PermissionBroker {
     });
   }
 
-  sandboxRun(request: PermissionRequest): Promise<PermissionResult> {
-    return this.#enqueue(async () => {
-      const decision = await this.#prompt(request);
-      if (decision.decision !== "allow-once" && decision.decision !== "allow-conversation") {
-        throw new BrokerError("PERMISSION_DENIED", "Sandbox run was not approved");
-      }
-      if (!this.#options.executeSandboxed) throw new BrokerError("SANDBOX_EXECUTOR_UNAVAILABLE", "No sandbox executor is available");
-      if (decision.decision === "allow-once") {
-        const requestId = requiredString(request, "requestId");
-        const agentId = requiredString(request, "agentId");
-        const operation = requiredString(request, "operation");
-        const target = requiredString(request, "target");
-        const capabilityId = `capability-${++this.#capabilitySequence}`;
-        const state: CapabilityState = { requestId, agentId, operation, target, usesRemaining: 1 };
-        this.#capabilities.set(capabilityId, state);
-        this.#consumeCapability({ ...request, consumeCapability: { capabilityId } });
-      }
-      return this.#options.executeSandboxed(request, decision.decision);
-    });
-  }
 }

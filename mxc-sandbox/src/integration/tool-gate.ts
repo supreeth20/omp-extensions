@@ -101,7 +101,7 @@ export function classifyToolCall(input: Record<string, unknown>): Record<string,
   }
   if (name === "browser") return allowedInitialHost(toolInput, policy);
   if (name === "lsp") return { action: "allow-host-adapter" };
-  if (name === "bash" || name === "powershell" || name === "sandbox_request" || name === "sandbox_run" || name === "job") {
+  if (name === "bash" || name === "powershell" || name === "sandbox_request" || name === "job") {
     return { action: "allow-sandbox-adapter" };
   }
   if (input.mutationOrExecution === true) return { action: "allow-host-unchanged", reason: "unadapted-tool" };
@@ -245,7 +245,7 @@ export async function interceptToolCall(
   }
   if (context.enabled !== true) return undefined;
   if (name === "bash" || name === "powershell") return { action: "sandbox" };
-  if (name === "sandbox_request" || name === "sandbox_run" || name === "job") return { action: "sandbox-adapter" };
+  if (name === "sandbox_request" || name === "job") return { action: "sandbox-adapter" };
 
   const policy = recordValue(context.sandboxPolicy ?? context.policy);
   if (name === "read" || name === "write" || name === "edit" || name === "ast_edit") {
@@ -389,39 +389,6 @@ const REQUEST_CAPABILITIES = new Set([
   "trusted-tool",
 ]);
 
-export function validateSandboxRunCapabilities(value: unknown): Record<string, unknown>[] {
-  if (value === undefined) return [];
-  if (!Array.isArray(value)) throw new ToolGateError("INVALID_SANDBOX_RUN_CAPABILITIES", "sandbox_run capabilities must be an array");
-  return value.map((candidate) => {
-    const request = recordValue(candidate);
-    const capability = request.capability;
-    const grantValue = request.value;
-    if (typeof capability !== "string" || !REQUEST_CAPABILITIES.has(capability)) {
-      throw new ToolGateError("UNSUPPORTED_SANDBOX_CAPABILITY", "The requested sandbox capability is not supported");
-    }
-    if (typeof grantValue !== "string" || grantValue.length === 0) {
-      throw new ToolGateError("INVALID_SANDBOX_CAPABILITY_VALUE", "A non-empty capability value is required");
-    }
-    const scope = request.scope === undefined ? "once" : request.scope;
-    if (scope !== "once" && scope !== "conversation") {
-      throw new ToolGateError("INVALID_SANDBOX_CAPABILITY_SCOPE", "sandbox_run capabilities support only once or conversation scope");
-    }
-    validateCapabilityValue(capability, grantValue, true);
-    const recursive = request.recursive === true;
-    if (request.recursive !== undefined && typeof request.recursive !== "boolean") {
-      throw new ToolGateError("INVALID_SANDBOX_CAPABILITY_VALUE", "recursive must be boolean");
-    }
-    if (recursive && capability !== "read" && capability !== "write") {
-      throw new ToolGateError("INVALID_SANDBOX_CAPABILITY_VALUE", "Only filesystem capabilities may be recursive");
-    }
-    return {
-      capability,
-      value: grantValue,
-      scope,
-      ...(recursive ? { recursive: true, kind: "directory" } : {}),
-    };
-  });
-}
 
 export async function sandboxRequest(input: Record<string, unknown>, context: Record<string, unknown>): Promise<Record<string, unknown>> {
   let capability = input.capability;
@@ -523,6 +490,7 @@ export async function executeOutsideOnce(input: Record<string, unknown>): Promis
     cwd: input.cwd,
     agentId: input.agentId,
     env: input.hostEnvironment,
+    timeout: input.timeout,
   }));
 }
 
@@ -534,12 +502,4 @@ export async function handleMxcLaunchFailure(input: Record<string, unknown>): Pr
   if (choice === "Disable sandbox for this conversation") return { disableRequested: true };
   if (choice === "Cancel") return { cancelled: true };
   throw new ToolGateError("INVALID_FAILURE_CHOICE", "MXC launch failure prompt returned an invalid choice");
-}
-
-export async function sandboxRun(input: Record<string, unknown>, context: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const broker = recordValue(context.permissionBroker);
-  if (typeof broker.sandboxRun !== "function") {
-    throw new ToolGateError("SANDBOX_BROKER_UNAVAILABLE", "Atomic sandbox_run requires the session permission broker");
-  }
-  return recordValue(await broker.sandboxRun(input));
 }

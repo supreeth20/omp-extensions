@@ -74,8 +74,10 @@ export function assertWindowsNetworkPolicy(policy: UnknownRecord, capabilities: 
   if (network.localNetwork === true && capabilities.independentLocalNetwork !== true) {
     throw new WindowsContainmentError("LOCAL_NETWORK_CAPABILITY_UNPROVEN", "Local-network grants require a successful native traffic probe attestation");
   }
-  if (network.localNetwork === false && network.internet === true && capabilities.independentLocalNetwork !== true) {
-    throw new WindowsContainmentError("LOCAL_NETWORK_ENFORCEMENT_UNAVAILABLE", "Independent local-network blocking was not proven by a native traffic probe");
+  if (network.localNetwork === false && network.internet === true
+    && capabilities.internetLocalNetworkIsolation !== true
+    && capabilities.independentLocalNetwork !== true) {
+    throw new WindowsContainmentError("LOCAL_NETWORK_ENFORCEMENT_UNAVAILABLE", "Internet access was not proven to exclude local-network destinations by a native traffic probe");
   }
 }
 

@@ -1,7 +1,9 @@
+import { execFileSync } from "node:child_process";
 import { accessSync, constants, existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { delimiter, dirname, join, normalize, sep } from "node:path";
 import * as installedMxcSdk from "@microsoft/mxc-sdk";
 import sdkPackageMetadata from "../../node_modules/@microsoft/mxc-sdk/package.json";
+import * as installedMxcPlatform from "../../node_modules/@microsoft/mxc-sdk/dist/platform.js";
 import { buildInternalTrafficProbeConfig, buildProcessConfig, createEffectivePolicy, MXC_SCHEMA_VERSION, toSdkCommandLine, toSdkEnvironment, toSdkPolicy, type MxcInvocationConfig } from "./config";
 
 const REQUIRED_SDK_VERSION = /^0\.7\.0(?:[-+]|$)/;
@@ -178,10 +180,22 @@ export async function loadMxcSdk(): Promise<MxcSdkAdapter> {
       schemaVersions: [MXC_SCHEMA_VERSION],
       createConfigFromPolicy: module.createConfigFromPolicy as CreateConfig,
       spawnSandboxFromConfig: module.spawnSandboxFromConfig as SpawnConfig,
-      getPlatformSupport: () => record((module.getPlatformSupport as () => unknown)()),
+      getPlatformSupport: () => record(installedMxcPlatform.getPlatformSupport()),
       reprobePlatformSupport: () => {
-        if (typeof module._resetPlatformSupportCache === "function") module._resetPlatformSupportCache();
-        return record((module.getPlatformSupport as () => unknown)());
+        installedMxcPlatform._resetPlatformSupportCache();
+        if (process.platform !== "win32") return record(installedMxcPlatform.getPlatformSupport());
+        const executable = installedMxcPlatform.findWxcExecutable();
+        if (!executable) return record(installedMxcPlatform.getPlatformSupport());
+        installedMxcPlatform._setProbeRunner(() => execFileSync(executable, ["--probe"], {
+          timeout: 30_000,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }));
+        try {
+          return record(installedMxcPlatform.getPlatformSupport());
+        } finally {
+          installedMxcPlatform._setProbeRunner(null);
+        }
       },
       discoverRequiredReadonlyPaths: () => {
         const discovered = record((module.getAvailableToolsPolicy as (environment?: NodeJS.ProcessEnv, options?: UnknownRecord) => unknown)(process.env, process.platform === "win32" ? { containerType: "processcontainer" } : undefined));

@@ -1,4 +1,5 @@
 import { stat } from "node:fs/promises";
+import { join } from "node:path";
 import { canonicalizeTarget } from "../policy/paths";
 import { assertMacosSeatbeltPolicy } from "../platform/macos";
 import { assertWindowsNetworkPolicy } from "../platform/windows";
@@ -12,6 +13,7 @@ export type ProcessEnvironment = Readonly<Record<string, string>>;
 export interface ShellLaunch {
   executable: string;
   args: readonly string[];
+  dialect?: "posix" | "powershell7" | "cmd";
   ui?: Readonly<{
     allowWindows: boolean;
     clipboardRead: boolean;
@@ -118,6 +120,23 @@ export function createEffectivePolicy(value: unknown): Record<string, unknown> {
   };
 }
 
+function quoteCmdArgument(value: string): string {
+  return `"${value.replaceAll("\"", "\"\"")}"`;
+}
+
+function processCommandLine(shell: ShellLaunch, command: string, cwd: string, platform: string, readyMarker?: string): string[] {
+  if (platform !== "win32" || shell.dialect !== "powershell7") return [shell.executable, ...shell.args, command];
+  const powershellArguments = shell.args.filter((argument) => argument.toLowerCase() !== "-command").join(" ");
+  const executable = quoteCmdArgument(shell.executable);
+  const workingDirectoryLiteral = cwd.replaceAll("'", "''");
+  const userCommand = Buffer.from(command, "utf16le").toString("base64");
+  const removeItemCompatibility = `function global:Remove-Item {[CmdletBinding(SupportsShouldProcess=$true,DefaultParameterSetName='Path')]param([Parameter(Position=0,Mandatory=$true,ValueFromPipeline=$true,ValueFromPipelineByPropertyName=$true,ParameterSetName='Path')][string[]]$Path,[Alias('PSPath','LP')][Parameter(Mandatory=$true,ValueFromPipelineByPropertyName=$true,ParameterSetName='LiteralPath')][string[]]$LiteralPath,[string]$Filter,[string[]]$Include,[string[]]$Exclude,[switch]$Recurse,[switch]$Force,[pscredential]$Credential)process{$bound=@{};foreach($entry in $PSBoundParameters.GetEnumerator()){$bound[$entry.Key]=$entry.Value};$key=if($PSCmdlet.ParameterSetName -eq 'LiteralPath'){'LiteralPath'}else{'Path'};$bound[$key]=@($bound[$key]|ForEach-Object{if([IO.Path]::IsPathRooted($_) -or $_ -match '^[^\\/:]+:'){$_}else{[IO.Path]::GetFullPath($_,[Environment]::CurrentDirectory)}});Microsoft.PowerShell.Management\\Remove-Item @bound}}`;
+  const readySignal = readyMarker ? `[Console]::Error.WriteLine('${readyMarker.replaceAll("'", "''")}'); [Console]::Error.Flush(); ` : "";
+  const bootstrap = `New-PSDrive -Name MXC -PSProvider FileSystem -Root '${workingDirectoryLiteral}' | Out-Null; Set-Location MXC:\\; [Environment]::CurrentDirectory='${workingDirectoryLiteral}'; ${removeItemCompatibility}; $script=[ScriptBlock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${userCommand}'))); ${readySignal}& $script; $success=$?; if($LASTEXITCODE -is [int]){exit $LASTEXITCODE}; if(-not $success){exit 1}`;
+  const launcher = `${executable} ${powershellArguments} -EncodedCommand ${Buffer.from(bootstrap, "utf16le").toString("base64")}`;
+  return [join(process.env.SystemRoot ?? "C:\\Windows", "System32", "cmd.exe"), "/d", "/s", "/c", launcher];
+}
+
 function buildProcessConfigInternal(input: Record<string, unknown>, internalTrafficProbe: boolean): MxcInvocationConfig {
   const shell = record(input.shell) as unknown as ShellLaunch;
   if (typeof shell.executable !== "string" || !Array.isArray(shell.args)) {
@@ -147,7 +166,7 @@ function buildProcessConfigInternal(input: Record<string, unknown>, internalTraf
     platform,
     policy: { ...policy, ui },
     process: {
-      commandLine: [shell.executable, ...shell.args, String(input.command ?? "")],
+      commandLine: processCommandLine(shell, String(input.command ?? ""), cwd, platform, typeof input.readyMarker === "string" ? input.readyMarker : undefined),
       cwd,
       env: stringEnvironment(input.env),
       inheritEnvironment: false,
@@ -190,7 +209,8 @@ async function sdkPathList(value: unknown, field: "read" | "write" | "deny"): Pr
     }
     const resolved = await canonicalizeTarget(path);
     const resolvedAncestor = String(resolved.resolvedAncestor);
-    const target = String(resolved.canonical);
+    const canonical = String(resolved.canonical);
+    const target = /^[A-Za-z]:[\\/]?$/.test(path) ? `${path.slice(0, 2)}\\` : canonical;
     const targetExists = Array.isArray(resolved.unresolvedSuffix) && resolved.unresolvedSuffix.length === 0;
     const targetIsDirectory = targetExists && (await stat(resolvedAncestor)).isDirectory();
     const exact = field !== "deny" && (typeof item === "string" || grant.recursive !== true);
@@ -264,6 +284,14 @@ function quotePosixCommandArgument(value: string): string {
 
 export function toSdkCommandLine(commandLine: readonly string[], platform: string = process.platform): string {
   const quote = platform === "win32" ? quoteWindowsCommandArgument : quotePosixCommandArgument;
+  if (platform === "win32") {
+    const executable = commandLine[0]?.replaceAll("\\", "/").split("/").at(-1)?.toLowerCase();
+    const commandIndex = commandLine.findIndex((argument) => argument.toLowerCase() === "/c");
+    if (executable === "cmd.exe" && commandIndex >= 0 && commandIndex === commandLine.length - 2) {
+      const prefix = commandLine.slice(0, commandIndex + 1).map(quote).join(" ");
+      return `${prefix} "${commandLine[commandIndex + 1]}"`;
+    }
+  }
   return commandLine.map(quote).join(" ");
 }
 

@@ -8,7 +8,6 @@ type HandleLifecycle = (event: Record<string, unknown>, store: Record<string, un
 type PermissionRequest = Record<string, any>;
 type Broker = {
   request(input: PermissionRequest): Promise<Record<string, any>>;
-  sandboxRun(input: PermissionRequest): Promise<Record<string, any>>;
 };
 type BrokerConstructor = new (options: Record<string, unknown>) => Broker;
 
@@ -193,16 +192,4 @@ describe("permission broker", () => {
     expect(await broker.request({ requestId: "R3", agentId: "future-child", sessionTreeId: "TREE1", operation: "read", target: "/repo/data" })).toMatchObject({ allowed: true, source: "conversation-grant" });
   });
 
-  test("authorizes and executes sandbox_run atomically with the complete command", async () => {
-    const mod = await loadContract("broker");
-    const PermissionBroker = requiredExport<BrokerConstructor>(mod, "PermissionBroker");
-    const seen: Record<string, any>[] = [];
-    const broker = new PermissionBroker({
-      prompt: async (request: PermissionRequest) => { seen.push({ phase: "prompt", request }); return { decision: "allow-once" }; },
-      executeSandboxed: async (request: PermissionRequest) => { seen.push({ phase: "execute", request }); return { exitCode: 0, stdout: "ok" }; },
-    });
-    const request = { requestId: "RUN1", agentId: "A1", operation: "shell", target: "cat /approved/a", shell: "bash", command: "cat /approved/a", capabilities: [{ operation: "read", target: "/approved/a", scope: "once" }] };
-    expect(await broker.sandboxRun(request)).toEqual({ exitCode: 0, stdout: "ok" });
-    expect(seen).toEqual([{ phase: "prompt", request }, { phase: "execute", request }]);
-  });
 });

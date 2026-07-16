@@ -5,14 +5,15 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { PermissionBroker } from "./src/broker/permission-broker";
 import { createStateMutation, disableSandbox, parseSandboxCommand, updateMxc } from "./src/commands/sandbox";
-import { interceptToolCall, sandboxRequest, sandboxRun, validateSandboxRunCapabilities } from "./src/integration/tool-gate";
+import { interceptToolCall, sandboxRequest } from "./src/integration/tool-gate";
 import { probeNativeMxcExecution } from "./src/mxc/probe";
 import { loadMxcSdk, pruneLegacyDiscoveredPathGrants } from "./src/mxc/sdk";
 import { assertPlatformPolicySupported } from "./src/mxc/config";
+import { buildSandboxEnvironment } from "./src/policy/environment";
 import { resolveNetworkPolicy } from "./src/policy/network";
 import { loadProfileLayers, mergePolicyLayers } from "./src/profiles";
 import { activateSandbox, ActivationError, probePublicOmpRuntime } from "./src/runtime/features";
-import { executeShell, resolveShell } from "./src/runtime/process";
+import { createContainerId, executeShell, resolveShell } from "./src/runtime/process";
 import type { StateRecord } from "./src/state";
 import { handleSessionLifecycle, ProcessSensitiveApprovalStore, serializeState, snapshotBranchState } from "./src/state";
 import { createDashboardPresentation, discoveredReadonlyGrants, getInitialSetupDefaults, createDashboardModel, createReenableModel, requireInteractiveUi, runSandboxDashboard } from "./src/ui";
@@ -33,12 +34,18 @@ export interface ExtensionDependencies {
   probeMxcExecution?: (input: Record<string, unknown>) => Promise<Record<string, unknown>>;
   platform?: string;
   homeDirectory?: string;
+  spawnHost?: (
+    executable: string,
+    arguments_: string[],
+    input: Record<string, unknown>,
+    onUpdate: (update: Record<string, unknown>) => void,
+  ) => Promise<Record<string, unknown>>;
 }
 
 
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const EXTENSION_DIRECTORY = basename(MODULE_DIRECTORY) === "dist" ? dirname(MODULE_DIRECTORY) : MODULE_DIRECTORY;
-const ADAPTED_TOOLS = new Set(["bash", "powershell", "read", "write", "edit", "ast_edit", "lsp", "web_search", "browser", "job", "sandbox_request", "sandbox_run"]);
+const ADAPTED_TOOLS = new Set(["bash", "powershell", "read", "write", "edit", "ast_edit", "lsp", "web_search", "browser", "job", "sandbox_request"]);
 const KNOWN_READ_ONLY_TOOLS = new Set(["grep", "glob"]);
 const SANDBOX_COMMAND_COMPLETIONS = [
   { value: "status", label: "status", description: "Show whether sandboxing is enabled" },
@@ -82,18 +89,6 @@ function objectSchema(api: ExtensionApi, shape: Record<string, unknown>): unknow
   return typeof zod.object === "function" ? zod.object(shape) : { type: "object", properties: shape };
 }
 
-function arraySchema(api: ExtensionApi, item: unknown): unknown {
-  const zod = recordValue(api.zod);
-  const value = typeof zod.array === "function" ? zod.array(item) : { type: "array", items: item };
-  const candidate = recordValue(value);
-  return typeof candidate.optional === "function" ? candidate.optional() : value;
-}
-
-function sandboxCapabilitySchema(api: ExtensionApi): unknown {
-  return objectSchema(api, {
-    capability: schema(api, "string"), value: schema(api, "string"), scope: schema(api, "string"), recursive: schema(api, "boolean"),
-  });
-}
 
 function toolInvocation(arguments_: unknown[]): { actual: boolean; input: Record<string, unknown>; context: Record<string, unknown> } {
   if (typeof arguments_[0] === "string") {
@@ -110,6 +105,164 @@ function toolInvocation(arguments_: unknown[]): { actual: boolean; input: Record
 function toolResult(value: Record<string, unknown>): Record<string, unknown> {
   const text = typeof value.preview === "string" ? value.preview : JSON.stringify(value);
   return { content: [{ type: "text", text }], details: value };
+}
+
+function powerShellToolResult(value: Record<string, unknown>, input: Record<string, unknown> = {}): Record<string, unknown> {
+  const stdout = typeof value.stdout === "string" ? value.stdout : "";
+  const stderr = typeof value.stderr === "string" ? value.stderr : "";
+  const normalized = typeof value.preview === "string" ? value : { ...value, preview: `${stdout}${stderr}` || "(no output)" };
+  const result = toolResult(normalized);
+  const exitCode = typeof normalized.exitCode === "number" ? normalized.exitCode : undefined;
+  return {
+    ...result,
+    details: {
+      ...normalized,
+      ...(typeof input.timeout === "number" ? {
+        timeoutSeconds: typeof normalized.timeoutSeconds === "number" ? normalized.timeoutSeconds : input.timeout,
+        requestedTimeoutSeconds: typeof normalized.requestedTimeoutSeconds === "number" ? normalized.requestedTimeoutSeconds : input.timeout,
+      } : {}),
+    },
+    isError: exitCode !== undefined && exitCode !== 0 || normalized.timedOut === true || normalized.cancelled === true,
+  };
+}
+
+function hostShellToolResult(value: Record<string, unknown>, input: Record<string, unknown>, powershell: boolean): Record<string, unknown> {
+  const stdout = typeof value.stdout === "string" ? value.stdout : "";
+  const stderr = typeof value.stderr === "string" ? value.stderr : "";
+  const normalized = { ...value, preview: `${stdout}${stderr}` || "(no output)" };
+  return powershell ? powerShellToolResult(normalized, input) : toolResult(normalized);
+}
+
+function normalizeHostExecResult(value: Record<string, unknown>): Record<string, unknown> {
+  const exitCode = typeof value.exitCode === "number"
+    ? value.exitCode
+    : typeof value.code === "number" ? value.code : undefined;
+  return {
+    ...value,
+    ...(exitCode === undefined ? {} : { exitCode }),
+    ...(value.killed === true ? { cancelled: true } : {}),
+  };
+}
+
+async function executeStreamingHostProcess(
+  executable: string,
+  arguments_: string[],
+  input: Record<string, unknown>,
+  onUpdate: (update: Record<string, unknown>) => void,
+): Promise<Record<string, unknown>> {
+  const environment = { ...process.env };
+  for (const [name, value] of Object.entries(recordValue(input.env))) {
+    if (typeof value === "string") environment[name] = value;
+  }
+  const started = Date.now();
+  const processHandle = Bun.spawn({
+    cmd: [executable, ...arguments_],
+    ...(typeof input.cwd === "string" ? { cwd: input.cwd } : {}),
+    env: environment,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  let stdout = "";
+  let stderr = "";
+  let preview = "";
+  const pump = async (stream: ReadableStream<Uint8Array>, name: "stdout" | "stderr"): Promise<void> => {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value, { stream: true });
+      if (name === "stdout") stdout += text;
+      else stderr += text;
+      preview += text;
+      onUpdate({ stream: name, data: text });
+    }
+    const tail = decoder.decode();
+    if (tail.length > 0) {
+      if (name === "stdout") stdout += tail;
+      else stderr += tail;
+      preview += tail;
+      onUpdate({ stream: name, data: tail });
+    }
+  };
+  const signal = input.signal instanceof AbortSignal ? input.signal : undefined;
+  let cancelled = signal?.aborted === true;
+  let timedOut = false;
+  const terminate = (): void => { processHandle.kill(); };
+  const abort = (): void => { cancelled = true; terminate(); };
+  signal?.addEventListener("abort", abort, { once: true });
+  if (cancelled) terminate();
+  const timeoutMs = typeof input.timeout === "number" && Number.isFinite(input.timeout) && input.timeout > 0
+    ? input.timeout * 1000
+    : undefined;
+  const timeout = timeoutMs === undefined ? undefined : setTimeout(() => {
+    timedOut = true;
+    terminate();
+  }, timeoutMs);
+  try {
+    const [exitCode] = await Promise.all([
+      processHandle.exited,
+      pump(processHandle.stdout, "stdout"),
+      pump(processHandle.stderr, "stderr"),
+    ]);
+    return {
+      preview: preview || "(no output)",
+      stdout,
+      stderr,
+      exitCode,
+      killed: cancelled || timedOut,
+      cancelled,
+      timedOut,
+      wallTimeMs: Date.now() - started,
+    };
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function powerShellRenderer(api: ExtensionApi): Record<string, unknown> {
+  const pi = recordValue(api.pi);
+  const fallback = recordValue(pi.bashToolRenderer);
+  const configured = typeof pi.createShellRenderer === "function"
+    ? recordValue(pi.createShellRenderer({
+        resolveTitle: () => "PowerShell",
+        resolveCommand: (args: unknown) => recordValue(args).command,
+        resolveCwd: (args: unknown) => recordValue(args).cwd,
+        resolveEnv: (args: unknown) => recordValue(args).env,
+        showHeader: true,
+      }))
+    : {};
+  const renderer = {
+    ...fallback,
+    ...configured,
+  };
+  if (typeof renderer.renderCall !== "function" || typeof renderer.renderResult !== "function") return {};
+  return {
+    renderCall: renderer.renderCall,
+    renderResult: renderer.renderResult,
+    mergeCallAndResult: renderer.mergeCallAndResult ?? true,
+    inline: renderer.inline ?? true,
+  };
+}
+
+function cumulativeShellUpdate(
+  onUpdate: (update: Record<string, unknown>) => void,
+  minimumIntervalMs = 100,
+  details: Record<string, unknown> | undefined = undefined,
+): (update: Record<string, unknown>) => void {
+  let preview = "";
+  let lastEmit = 0;
+  return (update: Record<string, unknown>): void => {
+    const data = update.data;
+    if (typeof data === "string") preview += data;
+    else if (data instanceof Uint8Array) preview += new TextDecoder().decode(data);
+    const now = Date.now();
+    if (minimumIntervalMs > 0 && now - lastEmit < minimumIntervalMs) return;
+    lastEmit = now;
+    onUpdate({ content: [{ type: "text", text: preview }], details });
+  };
 }
 
 function notify(context: Record<string, unknown>, message: string, type: "info" | "warning" | "error" = "info"): void {
@@ -388,7 +541,6 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
 
   const sensitiveApprovals = new ProcessSensitiveApprovalStore();
   const promptContexts = new Map<string, Record<string, unknown>>();
-  const sandboxExecutors = new Map<string, (decision?: "allow-once" | "allow-conversation") => Promise<Record<string, unknown>>>();
   const oneTimeCapabilities: Record<string, unknown>[] = [];
   const registryOwner = {};
   const registeredParentTrees = new Set<string>();
@@ -451,11 +603,6 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
       const broker = recordValue(parent);
       if (typeof broker.request !== "function") throw errorWithCode("NO_INTERACTIVE_PARENT", "No interactive parent broker request surface is available");
       return recordValue(await broker.request(request));
-    },
-    executeSandboxed: async (request, decision) => {
-      const execute = sandboxExecutors.get(String(request.requestId));
-      if (!execute) throw errorWithCode("SANDBOX_EXECUTOR_UNAVAILABLE", "No sandbox executor is registered for this atomic request");
-      return execute(decision);
     },
   });
   state.parentBroker = permissionBroker;
@@ -695,23 +842,50 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
       },
       probeMxcExecution: async (probeRequest: unknown) => {
         const requested = recordValue(probeRequest);
-        const shell = resolveShell({
+        const configuredShell = resolveShell({
           platform: runtimePlatform,
           requested: "bash",
           configuredShell: typeof context.configuredShell === "string" ? context.configuredShell : process.env.SHELL,
           discovered: context.discoveredExecutables,
         });
+        const trafficShell = runtimePlatform === "win32"
+          ? resolveShell({
+              platform: runtimePlatform,
+              requested: "powershell",
+              configuredShell: typeof context.configuredShell === "string" ? context.configuredShell : process.env.SHELL,
+              discovered: context.discoveredExecutables,
+            })
+          : configuredShell;
+        const shell = runtimePlatform === "win32"
+          ? {
+              executable: join(process.env.SystemRoot ?? "C:\\Windows", "System32", "cmd.exe"),
+              args: ["/d", "/s", "/c"],
+              dialect: "cmd",
+              ui: { allowWindows: false, clipboardRead: false, clipboardWrite: false, inputInjection: false },
+            }
+          : configuredShell;
+        const hostEnvironment = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
         const cwd = typeof context.cwd === "string" ? context.cwd : process.cwd();
         const capabilities = recordValue(requested.platformCapabilities);
         const compatibility = requested.windowsMode === "compatibility" && requested.allowDaclMutation === true;
+        const shellRead = runtimePlatform === "win32"
+          ? { path: dirname(shell.executable), kind: "directory", recursive: true }
+          : { path: shell.executable, kind: "file" };
         const probeInput = {
+          ...(runtimePlatform === "win32"
+            ? {
+                containerId: createContainerId(),
+                trafficShell,
+                env: buildSandboxEnvironment(hostEnvironment, {}),
+                requiredReadonlyPaths: [...new Set([dirname(configuredShell.executable), dirname(trafficShell.executable)])],
+              }
+            : { env: { PATH: process.env.PATH ?? "" } }),
           platform: runtimePlatform,
           shell,
           cwd,
-          env: { PATH: process.env.PATH ?? "" },
           platformCapabilities: capabilities,
           policy: {
-            filesystem: { read: [{ path: cwd, kind: "directory", recursive: true }, { path: shell.executable, kind: "file" }], write: [] },
+            filesystem: { read: [{ path: cwd, kind: "directory", recursive: true }, shellRead], write: [] },
             network: { internet: false, localNetwork: false },
             ...(runtimePlatform === "win32" ? { mxcOverrides: { fallback: { allowDaclMutation: compatibility } } } : {}),
           },
@@ -757,6 +931,10 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
       tier: probed.tier ?? support.isolationTier,
       nativeEnforcementAvailable,
       independentLocalNetwork: probed.independentLocalNetwork === true,
+      ...(runtimePlatform === "win32" ? {
+        internetLocalNetworkIsolation: probed.internetLocalNetworkIsolation === true,
+        localNetworkAvailable: probed.localNetworkAvailable === true,
+      } : {}),
       hostPreparationVerified: probed.hostPreparationVerified === true,
     };
   };
@@ -826,7 +1004,12 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
     return reconciled;
   };
 
-  const executeHostShell = async (shell: "bash" | "powershell", input: Record<string, unknown>, context: Record<string, unknown>): Promise<unknown> => {
+  const executeHostShell = async (
+    shell: "bash" | "powershell",
+    input: Record<string, unknown>,
+    context: Record<string, unknown>,
+    onUpdate?: (update: Record<string, unknown>) => void,
+  ): Promise<unknown> => {
     if (typeof api.exec !== "function") throw errorWithCode("HOST_EXECUTOR_UNAVAILABLE", "OMP exec is unavailable");
     if (shell === "powershell" && runtimePlatform !== "win32") throw errorWithCode("POWERSHELL_7_REQUIRED", "PowerShell host execution requires Windows and PowerShell 7");
     const resolved = resolveShell({
@@ -835,6 +1018,15 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
       configuredShell: typeof context.configuredShell === "string" ? context.configuredShell : process.env.SHELL,
       discovered: context.discoveredExecutables,
     });
+    if (typeof onUpdate === "function") {
+      return (dependencies.spawnHost ?? executeStreamingHostProcess)(resolved.executable, [...resolved.args, String(input.command ?? "")], { ...input, signal: context.signal }, onUpdate);
+    }
+    if (shell === "powershell") {
+      const timeoutMs = typeof input.timeout === "number" && Number.isFinite(input.timeout) && input.timeout > 0 ? input.timeout * 1000 : undefined;
+      const options = { cwd: input.cwd, env: input.env, ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }) };
+      const result = await (api.exec as (...arguments_: unknown[]) => unknown)(resolved.executable, [...resolved.args, String(input.command ?? "")], options);
+      return normalizeHostExecResult(recordValue(result));
+    }
     const options = {
       cwd: input.cwd,
       env: input.env,
@@ -844,11 +1036,20 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
   };
 
   const runShell = async (shell: "bash" | "powershell", invocation: { actual: boolean; input: Record<string, unknown>; context: Record<string, unknown> }, derived?: { policy: Record<string, unknown>; sensitiveApprovedNames: string[] }): Promise<unknown> => {
+    const onShellUpdate = invocation.context.onShellUpdate;
+    const shellUpdate = invocation.actual && typeof onShellUpdate === "function"
+      ? cumulativeShellUpdate(onShellUpdate as (update: Record<string, unknown>) => void, shell === "bash" ? 0 : 100, shell === "bash" ? {} : undefined)
+      : undefined;
+    const sandboxUpdate = shellUpdate ?? (typeof onShellUpdate === "function"
+      ? onShellUpdate as (update: Record<string, unknown>) => void
+      : undefined);
     if (state.enabled !== true) {
       if (state.restorationFailed === true) {
         throw errorWithCode("SANDBOX_RESTORATION_FAILED", "Persisted sandbox restoration failed; model shell execution remains blocked until explicit disable or successful enable");
       }
-      return executeHostShell(shell, invocation.input, invocation.context);
+      const normalized = recordValue(await executeHostShell(shell, invocation.input, invocation.context, shellUpdate));
+      if (!invocation.actual) return normalized;
+      return hostShellToolResult(normalized, invocation.input, shell === "powershell");
     }
     const context = invocation.context;
     const own = ownership(context);
@@ -864,6 +1065,9 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
       return deny.capability === "sensitive-environment-name" && typeof deny.value === "string" ? [deny.value] : [];
     });
     const approvedSensitiveNames = invocationPolicy?.sensitiveApprovedNames ?? sensitiveApprovals.get(treeId, profileSensitiveNames());
+    if (shell === "powershell" && state.enabled === true && invocation.input.outsideSandbox !== true && typeof onShellUpdate === "function") {
+      (onShellUpdate as (update: Record<string, unknown>) => void)({ content: [{ type: "text", text: "" }], details: undefined });
+    }
     const result = await executeShell({
       ...invocation.input,
       shell,
@@ -882,10 +1086,10 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
       hasInteractiveOverlay: context.hasUI === true && Boolean(context.ptyOverlay),
       overlay: context.ptyOverlay,
       signal: context.signal,
-      onUpdate: context.onShellUpdate,
+      onUpdate: sandboxUpdate,
       renderer: context.shellRenderer,
       hostEnvironment: process.env,
-      executeHost: (input: Record<string, unknown>) => executeHostShell(shell, input, context),
+      executeHost: (input: Record<string, unknown>) => executeHostShell(shell, input, context, shellUpdate),
       approveOutsideOnce: async (details: Record<string, unknown>) => await brokeredSelection(context, "outside-once", exactShellDetails(shell, invocation, own.agentId, details), ["Approve", "Deny"], "Run outside MXC once?") === "Approve",
       confirmCritical: async (details: Record<string, unknown>) => await brokeredSelection(context, "critical-command", exactShellDetails(shell, invocation, own.agentId, details), ["Approve", "Deny"], "Confirm critical command") === "Approve",
       approveSensitiveNames: async (details: Record<string, unknown>) => {
@@ -898,7 +1102,7 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
         state.sensitiveApprovedNames = sensitiveApprovals.approve(treeId, selected);
         return selected;
       },
-      chooseFailure: (choices: string[]) => brokeredSelection(context, "mxc-launch-failure", exactShellDetails(shell, invocation, own.agentId, { choices }), choices, "MXC launch failed"),
+      chooseFailure: (choices: string[], failure: unknown) => brokeredSelection(context, "mxc-launch-failure", exactShellDetails(shell, invocation, own.agentId, { choices, ...(runtimePlatform === "win32" ? { failure: recordValue(failure) } : {}) }), choices, "MXC launch failed"),
       disableSandbox: async () => {
         state.enabled = false;
         state.priorConversationPolicy = true;
@@ -906,7 +1110,13 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
         updateSandboxIndicator(context);
       },
     });
-    return invocation.actual ? toolResult(result) : result;
+    if (!invocation.actual) return result;
+    const normalized = recordValue(result);
+    if (invocation.input.outsideSandbox === true || normalized.outsideSandbox === true) {
+      return hostShellToolResult(normalized, invocation.input, shell === "powershell");
+    }
+    if (shell === "powershell") return powerShellToolResult(normalized, invocation.input);
+    return toolResult(normalized);
   };
 
   api.registerCommand("sandbox", {
@@ -1241,60 +1451,12 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
     },
   });
 
-  api.registerTool({
-    name: "sandbox_run",
-    label: "Sandbox Run",
-    description: "Atomically request permission and run one sandboxed operation",
-    parameters: objectSchema(api, {
-      shell: schema(api, "string"), command: schema(api, "string"), env: schema(api, "record"), cwd: schema(api, "string"),
-      timeout: schema(api, "number"), pty: schema(api, "boolean"), async: schema(api, "boolean"), outsideSandbox: schema(api, "boolean"),
-      capabilities: arraySchema(api, sandboxCapabilitySchema(api)),
-    }),
-    approval: "exec",
-    execute: async (...arguments_: unknown[]): Promise<unknown> => {
-      const invocation = toolInvocation(arguments_);
-      if (state.enabled !== true) throw errorWithCode("SANDBOX_DISABLED", "sandbox_run requires an enabled sandbox");
-      const agentId = requesterIdentity(invocation.context);
-      const treeId = sessionTreeIdentity(invocation.context);
-      const capabilities: Record<string, unknown>[] = validateSandboxRunCapabilities(invocation.input.capabilities).map((capability) => ({ ...capability, sessionTreeId: treeId }));
-      if (capabilities.some((capability) => capability.capability === "local-network")
-        && recordValue(state.platformCapabilities).independentLocalNetwork !== true
-        && recordValue(state.platformCapabilities).coupledNetwork !== true) {
-        throw errorWithCode("LOCAL_NETWORK_CAPABILITY_UNPROVEN", "Local-network grants require a successful native traffic probe attestation");
-      }
-      const derived = deriveGrantPolicy(currentPolicy(), sensitiveApprovals.get(treeId, profileSensitiveNames()), capabilities, recordValue(state.platformCapabilities));
-      const expansion = {
-        shell: invocation.input.shell === "powershell" ? "powershell" : "bash",
-        command: String(invocation.input.command ?? ""),
-        cwd: typeof invocation.input.cwd === "string" ? invocation.input.cwd : process.cwd(),
-        capabilities,
-        exactPolicy: derived.policy,
-      };
-      const requestId = crypto.randomUUID();
-      const request = { requestId, agentId, sessionTreeId: treeId, headless: invocation.context.hasUI !== true, operation: "shell", target: String(invocation.input.command ?? ""), ...invocation.input, capabilities, capabilityExpansion: expansion };
-      promptContexts.set(requestId, { ...invocation.context, requestingAgent: agentId });
-      sandboxExecutors.set(requestId, async (approvalDecision) => {
-        if (approvalDecision === "allow-conversation") {
-          const conversationGrants = capabilities.filter((capability) => capability.scope === "conversation");
-          if (conversationGrants.length > 0) await applyGrants(conversationGrants);
-        }
-        return recordValue(await runShell(invocation.input.shell === "powershell" ? "powershell" : "bash", { ...invocation, actual: false, input: request }, derived));
-      });
-      try {
-        const result = await sandboxRun(request, { permissionBroker });
-        return invocation.actual ? toolResult(result) : result;
-      } finally {
-        promptContexts.delete(requestId);
-        sandboxExecutors.delete(requestId);
-      }
-    },
-  });
 
   if (shellAdapterRegistered) {
     api.registerTool({
       name: "bash",
       label: "Bash",
-      description: "Run a configured POSIX shell command in a fresh MXC process sandbox. After an access denial, use sandbox_run or sandbox_request instead of retrying unchanged.",
+      description: "Run a configured POSIX shell command in a fresh MXC process sandbox. After an access denial, use sandbox_request before retrying.",
       parameters: objectSchema(api, {
         command: schema(api, "string"), env: schema(api, "record"), cwd: schema(api, "string"), timeout: schema(api, "number"),
         pty: schema(api, "boolean"), async: schema(api, "boolean"), outsideSandbox: schema(api, "boolean"),
@@ -1306,12 +1468,15 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
       api.registerTool({
         name: "powershell",
         label: "PowerShell 7",
-        description: "Run PowerShell 7 in a fresh MXC ProcessContainer. After an access denial, use sandbox_run or sandbox_request instead of retrying unchanged.",
+        description: "Execute PowerShell 7 in a fresh MXC ProcessContainer. Returns stdout and stderr with Bash-style OMP rendering. PowerShell uses backticks for escaping, $env:NAME for environment variables, and doubled single quotes inside single-quoted strings. After an access denial, use sandbox_request before retrying.",
+        promptSnippet: "Execute PowerShell 7 commands in an MXC process sandbox",
+        promptGuidelines: ["Use PowerShell syntax, not Bash syntax; aliases include ls, cat, rm, cp, mv, pwd, and cd."],
         parameters: objectSchema(api, {
           command: schema(api, "string"), env: schema(api, "record"), cwd: schema(api, "string"), timeout: schema(api, "number"),
           pty: schema(api, "boolean"), async: schema(api, "boolean"), outsideSandbox: schema(api, "boolean"),
         }),
         approval: "exec",
+        ...powerShellRenderer(api),
         execute: async (...arguments_: unknown[]): Promise<unknown> => runShell("powershell", toolInvocation(arguments_)),
       });
     }

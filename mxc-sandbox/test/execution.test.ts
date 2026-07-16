@@ -16,6 +16,7 @@ type CreatePtyBridge = (input: Record<string, any>) => Record<string, any>;
 type FilterRequiredReadonlyPaths = (paths: string[], input: Record<string, string>) => string[];
 type ResolveRequiredReadonlyPaths = (paths: string[], input: Record<string, unknown>) => string[];
 type RuntimeRootForExecutableTarget = (target: string, platform: string) => string | undefined;
+type LoadMxcSdk = () => Promise<{ reprobePlatformSupport(): Record<string, unknown> }>;
 
 
 
@@ -46,6 +47,70 @@ describe("per-invocation MXC process configuration", () => {
       process: { commandLine: ["/bin/zsh", "-lc", "printf '%s' \"$GREETING\""], cwd: "/repo dir", env: { PATH: "/usr/bin:/bin", GREETING: "héllo world" }, timeoutMs: 1234 },
     });
     expect(config.process.inheritEnvironment).toBe(false);
+  });
+
+  test("sets the requested cwd inside contained Windows PowerShell", async () => {
+    const mod = await loadContract("execution");
+    const build = requiredExport<BuildInvocationConfig>(mod, "buildInvocationConfig");
+    const config = build({
+      platform: "win32",
+      shell: { executable: "C:\\Program Files\\PowerShell\\7\\pwsh.exe", args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command"], dialect: "powershell7" },
+      command: "Get-ChildItem -File | Select-Object -First 1",
+      cwd: "C:\\repo's dir",
+      env: {},
+      policy: { filesystem: { read: [{ path: "C:\\repo's dir", recursive: true }] }, network: { internet: false }, mxcOverrides: { fallback: { allowDaclMutation: true } } },
+      platformCapabilities: { windowsBuild: 26200, tier: "appcontainer-dacl", hostPreparationVerified: true, nativeEnforcementAvailable: false },
+      containerId: "mxc-powershell-cwd",
+    });
+    expect(config.process.commandLine.slice(0, 4)).toEqual(["C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/c"]);
+    const payload = String(config.process.commandLine.at(-1));
+    expect(payload).toContain(`"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -NoLogo -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand`);
+    const bootstrap = Buffer.from(payload.split(" -EncodedCommand ").at(-1) ?? "", "base64").toString("utf16le");
+    expect(bootstrap).toContain(`New-PSDrive -Name MXC -PSProvider FileSystem -Root 'C:\\repo''s dir'`);
+    expect(bootstrap).toContain(`[Environment]::CurrentDirectory='C:\\repo''s dir'`);
+    expect(bootstrap).toContain("function global:Remove-Item");
+    const encoded = /FromBase64String\('([^']+)'\)/.exec(bootstrap)?.[1] ?? "";
+    expect(Buffer.from(encoded, "base64").toString("utf16le")).toBe("Get-ChildItem -File | Select-Object -First 1");
+  });
+
+  test("launches portable preview PowerShell through contained cmd with an encoded command", async () => {
+    const mod = await loadContract("execution");
+    const build = requiredExport<BuildInvocationConfig>(mod, "buildInvocationConfig");
+    const config = build({
+      platform: "win32",
+      shell: { executable: "C:\\Users\\dev\\AppData\\Local\\Programs\\PowerShell\\7-preview\\pwsh.exe", args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command"], dialect: "powershell7" },
+      command: "Write-Output 'ok'",
+      cwd: "C:\\repo",
+      env: {},
+      policy: { filesystem: { read: [{ path: "C:\\repo", recursive: true }] }, network: { internet: false }, mxcOverrides: { fallback: { allowDaclMutation: true } } },
+      platformCapabilities: { windowsBuild: 26200, tier: "appcontainer-dacl", hostPreparationVerified: true, nativeEnforcementAvailable: false },
+      containerId: "mxc-preview-powershell",
+    });
+    expect(config.process.commandLine.slice(0, 4)).toEqual(["C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/c"]);
+    const payload = String(config.process.commandLine.at(-1));
+    expect(payload).toContain(`"C:\\Users\\dev\\AppData\\Local\\Programs\\PowerShell\\7-preview\\pwsh.exe" -NoLogo -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand`);
+    const bootstrap = Buffer.from(payload.split(" -EncodedCommand ").at(-1) ?? "", "base64").toString("utf16le");
+    expect(bootstrap).toContain(`New-PSDrive -Name MXC -PSProvider FileSystem -Root 'C:\\repo'`);
+    expect(bootstrap).toContain(`[Environment]::CurrentDirectory='C:\\repo'`);
+    expect(bootstrap).toContain("function global:Remove-Item");
+    const encoded = /FromBase64String\('([^']+)'\)/.exec(bootstrap)?.[1] ?? "";
+    expect(Buffer.from(encoded, "base64").toString("utf16le")).toBe("Write-Output 'ok'");
+  });
+
+  test("accepts internet-only Windows policy only with native local-destination isolation evidence", async () => {
+    const mod = await loadContract("execution");
+    const build = requiredExport<BuildInvocationConfig>(mod, "buildInvocationConfig");
+    const base = {
+      platform: "win32",
+      shell: { executable: "C:\\Windows\\System32\\cmd.exe", args: ["/d", "/s", "/c"], dialect: "cmd" },
+      command: "echo ok",
+      cwd: "C:\\repo",
+      env: {},
+      policy: { filesystem: { read: [{ path: "C:\\repo", recursive: true }] }, network: { internet: true, localNetwork: false }, mxcOverrides: { fallback: { allowDaclMutation: true } } },
+      containerId: "mxc-isolated-internet",
+    };
+    expect(build({ ...base, platformCapabilities: { windowsBuild: 26200, tier: "appcontainer-dacl", hostPreparationVerified: true, nativeEnforcementAvailable: false, internetLocalNetworkIsolation: true } }).policy.network).toMatchObject({ internet: true, localNetwork: false });
+    expect(() => build({ ...base, policy: { ...base.policy, network: { internet: false, localNetwork: true } }, platformCapabilities: { windowsBuild: 26200, tier: "appcontainer-dacl", hostPreparationVerified: true, nativeEnforcementAvailable: false, internetLocalNetworkIsolation: true } })).toThrow(expect.objectContaining({ code: "LOCAL_NETWORK_CAPABILITY_UNPROVEN" }));
   });
 
   test("leaves Darwin Seatbelt settings to SDK process backend defaults", async () => {
@@ -136,14 +201,31 @@ describe("per-invocation MXC process configuration", () => {
     const resolve = requiredExport<ResolveShell>(mod, "resolveShell");
     expect(resolve({ platform: "darwin", requested: "bash", configuredShell: "/bin/zsh" })).toEqual({ executable: "/bin/zsh", dialect: "posix", args: ["-lc"] });
     expect(resolve({ platform: "win32", requested: "bash", discovered: ["C:\\Program Files\\Git\\bin\\bash.exe"] })).toEqual({ executable: "C:\\Program Files\\Git\\bin\\bash.exe", dialect: "posix", args: ["-lc"] });
-    expect(() => resolve({ platform: "win32", requested: "bash", discovered: ["powershell.exe"] })).toThrow(expect.objectContaining({ code: "POSIX_BASH_REQUIRED" }));
+    expect(() => resolve({ platform: "win32", requested: "bash", discovered: ["powershell.exe"], environment: { PATH: "", ProgramFiles: "Z:\\missing", ProgramW6432: "Z:\\missing", LOCALAPPDATA: "Z:\\missing" } })).toThrow(expect.objectContaining({ code: "POSIX_BASH_REQUIRED" }));
   });
 
   test("requires PowerShell 7 and sets only the minimum startup window permission", async () => {
     const mod = await loadContract("execution");
     const resolve = requiredExport<ResolveShell>(mod, "resolveShell");
-    expect(resolve({ platform: "win32", requested: "powershell", discovered: ["C:\\Program Files\\PowerShell\\7\\pwsh.exe"] })).toEqual({ executable: "C:\\Program Files\\PowerShell\\7\\pwsh.exe", dialect: "powershell7", args: ["-NoLogo", "-NoProfile", "-Command"], ui: { allowWindows: true, clipboardRead: false, clipboardWrite: false, inputInjection: false } });
-    expect(() => resolve({ platform: "win32", requested: "powershell", discovered: ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"] })).toThrow(expect.objectContaining({ code: "POWERSHELL_7_REQUIRED", autoInstall: false }));
+    expect(resolve({ platform: "win32", requested: "powershell", discovered: ["C:\\Program Files\\PowerShell\\7\\pwsh.exe"], environment: { LOCALAPPDATA: "Z:\\missing", PATH: "" } })).toEqual({ executable: "C:\\Program Files\\PowerShell\\7\\pwsh.exe", dialect: "powershell7", args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command"], ui: { allowWindows: true, clipboardRead: false, clipboardWrite: false, inputInjection: false } });
+    expect(() => resolve({ platform: "win32", requested: "powershell", discovered: ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"], environment: { PATH: "", ProgramFiles: "Z:\\missing", ProgramW6432: "Z:\\missing" } })).toThrow(expect.objectContaining({ code: "POWERSHELL_7_REQUIRED", autoInstall: false }));
+  });
+
+  test("discovers PowerShell 7 and Git Bash without private OMP context fields", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mxc-shell-discovery-"));
+    try {
+      const powershell = join(root, "pwsh.exe");
+      const bash = join(root, "Git", "bin", "bash.exe");
+      await mkdir(join(root, "Git", "bin"), { recursive: true });
+      await Promise.all([writeFile(powershell, ""), writeFile(bash, "")]);
+      const mod = await loadContract("execution");
+      const resolve = requiredExport<ResolveShell>(mod, "resolveShell");
+      const environment = { PATH: root, ProgramFiles: root };
+      expect(resolve({ platform: "win32", requested: "powershell", environment })).toMatchObject({ executable: powershell, dialect: "powershell7" });
+      expect(resolve({ platform: "win32", requested: "bash", environment })).toMatchObject({ executable: bash, dialect: "posix" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("Windows strict mode defaults DACL mutation off", async () => {
@@ -278,6 +360,17 @@ describe("per-invocation MXC process configuration", () => {
     expect(() => build({ ...base, policy: { mxcOverrides: { fallback: { allowDaclMutation: true } } }, platformCapabilities: { windowsBuild: 26100, tier: 3, hostPreparationVerified: false, nativeEnforcementAvailable: false } })).toThrow(expect.objectContaining({ code: "WINDOWS_HOST_PREPARATION_REQUIRED" }));
     expect(build({ ...base, policy: { mxcOverrides: { fallback: { allowDaclMutation: true } } }, platformCapabilities: { windowsBuild: 26100, tier: 3, hostPreparationVerified: true, nativeEnforcementAvailable: false } }).fallback).toEqual({ allowDaclMutation: true });
   });
+
+  test("reprobes native Windows isolation facts without the SDK five-second diagnostics ceiling", async () => {
+    if (process.platform !== "win32") return;
+    const mod = await loadContract("sdk");
+    const loadMxcSdk = requiredExport<LoadMxcSdk>(mod, "loadMxcSdk");
+    const sdk = await loadMxcSdk();
+    const support = sdk.reprobePlatformSupport();
+    expect(support.isSupported).toBe(true);
+    expect(typeof support.isolationTier).toBe("string");
+    expect(["base-container", "appcontainer-bfs", "appcontainer-dacl"]).toContain(String(support.isolationTier));
+  });
   test("excludes unrelated user and application PATH directories from default read access", async () => {
     const mod = await loadContract("sdk");
     const filter = requiredExport<FilterRequiredReadonlyPaths>(mod, "filterRequiredReadonlyPaths");
@@ -351,7 +444,7 @@ describe("per-invocation MXC process configuration", () => {
     const guidance = requiredExport<SandboxDenialGuidance>(mod, "sandboxDenialGuidance");
     expect(guidance({ shell: "bash", command: "cat /private/data.txt", exitCode: 1, stderr: "cat: /private/data.txt: Operation not permitted", policy: { network: { internet: false } } })).toMatchObject({
       denied: true,
-      nextTool: "sandbox_run",
+      nextTool: "sandbox_request",
       capabilities: ["read", "write", "allowed-host", "internet", "local-network"],
     });
     expect(guidance({ shell: "powershell", command: "Invoke-WebRequest https://example.com", exitCode: 1, stderr: "Unable to connect", policy: { network: { internet: false } } })).toMatchObject({
@@ -380,14 +473,27 @@ describe("per-invocation MXC process configuration", () => {
       policy: { filesystem: { read: [], write: [] }, network: { internet: false } },
       spawn: async () => ({ exitCode: 1, stderr: "cat: /private/data.txt: Operation not permitted" }),
     });
-    expect(result.preview).toContain("sandbox_run");
     expect(result.preview).toContain("sandbox_request");
-    expect(result.details.sandboxDenial).toMatchObject({ denied: true, nextTool: "sandbox_run" });
+    expect(result.details.sandboxDenial).toMatchObject({ denied: true, nextTool: "sandbox_request" });
   });
 
 });
 
 describe("native local-network separation probe", () => {
+  test("keeps Windows activation runtime grants below command-line limits", async () => {
+    const mod = await loadContract("probe");
+    const select = requiredExport<(input: Record<string, unknown>) => string[]>(mod, "selectProbeRuntimeReadonlyPaths");
+    const bulkSdkPaths = Array.from({ length: 5000 }, (_, index) => `C:\\tools\\tool-${index}.exe`);
+    expect(select({
+      platform: "win32",
+      sdkPaths: bulkSdkPaths,
+      requestedPaths: ["C:\\Program Files\\Git\\bin"],
+      shellExecutable: "C:\\Windows\\System32\\cmd.exe",
+      spawnfile: "C:\\mxc\\wxc-exec.exe",
+    })).toEqual(["C:\\Program Files\\Git\\bin", "C:\\Windows\\System32", "C:\\mxc"]);
+    expect(select({ platform: "linux", sdkPaths: ["/usr/bin"], shellExecutable: "/bin/bash" })).toEqual(["/usr/bin", "/bin"]);
+  });
+
   test("attests only observed blocked and allowed traffic against its ephemeral endpoint", async () => {
     const mod = await loadContract("probe");
     const probe = requiredExport<(input: Record<string, any>) => Promise<Record<string, any>>>(mod, "probeIndependentLocalNetworkSeparation");
@@ -404,16 +510,43 @@ describe("native local-network separation probe", () => {
       await promise;
       return { exitCode: failed ? 24 : 0 };
     };
-    const attested = await probe({ privateHost: "127.0.0.1", attestAllowedHosts: true, executeTraffic });
+    const attested = await probe({ platform: "win32", privateHost: "127.0.0.1", attestAllowedHosts: true, executeTraffic });
     expect(attested.independentLocalNetwork).toBe(true);
     expect(attested.allowedHosts).toBe(true);
     expect(attested.evidence).toHaveLength(4);
     expect(attested.hostRuleEvidence).toHaveLength(2);
     expect(attested.evidence.filter((item: Record<string, any>) => item.mode === "blocked").every((item: Record<string, any>) => item.observed === false)).toBe(true);
     expect(attested.evidence.filter((item: Record<string, any>) => item.mode === "allowed").every((item: Record<string, any>) => item.observed === true)).toBe(true);
-    const unobserved = await probe({ privateHost: "127.0.0.1", attestAllowedHosts: true, executeTraffic: async () => ({ exitCode: 0 }) });
+    expect(attested.internetLocalNetworkIsolation).toBe(true);
+    expect(attested.localNetworkAvailable).toBe(true);
+    const internetOnly = await probe({ platform: "win32", privateHost: "127.0.0.1", executeTraffic: async () => ({ exitCode: 23 }) });
+    expect(internetOnly).toMatchObject({ internetLocalNetworkIsolation: true, localNetworkAvailable: false, independentLocalNetwork: false });
+    const unobserved = await probe({ platform: "win32", privateHost: "127.0.0.1", attestAllowedHosts: true, executeTraffic: async () => ({ exitCode: 0 }) });
     expect(unobserved.independentLocalNetwork).toBe(false);
     expect(unobserved.allowedHosts).toBe(false);
+  });
+
+  test("preserves upstream macOS and Linux traffic-probe semantics and result shape", async () => {
+    const mod = await loadContract("probe");
+    const probe = requiredExport<(input: Record<string, any>) => Promise<Record<string, any>>>(mod, "probeIndependentLocalNetworkSeparation");
+    const executeTraffic = async (input: Record<string, any>): Promise<Record<string, any>> => {
+      if (input.localNetwork !== true) return { exitCode: 23, timedOut: true };
+      const socket = createConnection({ host: input.host, port: input.port });
+      const { promise, resolve } = Promise.withResolvers<void>();
+      let failed = false;
+      socket.once("connect", () => socket.write(input.marker));
+      socket.once("data", () => socket.end());
+      socket.once("error", () => { failed = true; resolve(); });
+      socket.once("close", resolve);
+      await promise;
+      return { exitCode: failed ? 24 : 0 };
+    };
+    for (const platform of ["darwin", "linux"] as const) {
+      const result = await probe({ platform, privateHost: "127.0.0.1", executeTraffic });
+      expect(result.independentLocalNetwork).toBe(true);
+      expect(result).not.toHaveProperty("internetLocalNetworkIsolation");
+      expect(result).not.toHaveProperty("localNetworkAvailable");
+    }
   });
 
   test("launches controlled native traffic policies only through the internal probe seam", async () => {
@@ -542,6 +675,65 @@ describe("pipe, PTY, cancellation, and failure lifecycle", () => {
     expect(observedConfig?.process.timeoutMs).toBe(2500);
   });
 
+  test("adds Windows DACL setup grace without losing the requested command timeout", async () => {
+    const mod = await loadContract("execution");
+    const execute = requiredExport<ExecuteShell>(mod, "executeShell");
+    let observedConfig: Record<string, any> | undefined;
+    const result = await execute({
+      platform: "win32",
+      shell: "powershell",
+      discovered: ["C:\\Program Files\\PowerShell\\7\\pwsh.exe"],
+      command: "Write-Output ok",
+      timeout: 2.5,
+      policy: { mxcOverrides: { fallback: { allowDaclMutation: true } } },
+      platformCapabilities: { windowsBuild: 26200, tier: "appcontainer-dacl", hostPreparationVerified: true, nativeEnforcementAvailable: false },
+      spawn: async (config: Record<string, any>) => { observedConfig = config; return { exitCode: 0 }; },
+    });
+    expect(observedConfig?.process.timeoutMs).toBe(32_500);
+    expect(result).toMatchObject({ timeoutSeconds: 2.5, notices: [] });
+    expect(result).not.toHaveProperty("requestedTimeoutSeconds");
+  });
+
+  test("starts the requested timeout after contained PowerShell signals readiness", async () => {
+    const mod = await loadContract("execution");
+    const execute = requiredExport<ExecuteShell>(mod, "executeShell");
+    const pendingExit = Promise.withResolvers<Record<string, unknown>>();
+    let scheduledMilliseconds: number | undefined;
+    let kills = 0;
+    const result = await execute({
+      platform: "win32",
+      shell: "powershell",
+      discovered: ["C:\\Program Files\\PowerShell\\7\\pwsh.exe"],
+      command: "Start-Sleep -Seconds 30",
+      timeout: 2.5,
+      policy: { mxcOverrides: { fallback: { allowDaclMutation: true } } },
+      platformCapabilities: { windowsBuild: 26200, tier: "appcontainer-dacl", hostPreparationVerified: true, nativeEnforcementAvailable: false },
+      spawn: async (config: Record<string, any>, events: Record<string, (data: string) => void>) => {
+        expect(scheduledMilliseconds).toBeUndefined();
+        const payload = String(config.process.commandLine.at(-1));
+        const bootstrap = Buffer.from(payload.split(" -EncodedCommand ").at(-1) ?? "", "base64").toString("utf16le");
+        const marker = bootstrap.match(/__OMP_MXC_READY_[A-Za-z0-9_-]+__/)?.[0];
+        expect(marker).toBeDefined();
+        events.stderr!("DACL recovery: 1 file(s), 1 ACE(s) restored, 0 error(s)\n");
+        events.stderr!(marker!.slice(0, 12));
+        expect(scheduledMilliseconds).toBeUndefined();
+        events.stderr!(`${marker!.slice(12)}\r\n`);
+        return { kill: () => { kills += 1; } };
+      },
+      awaitExit: async () => pendingExit.promise,
+      scheduleTimeout: (callback: () => void, milliseconds: number) => {
+        scheduledMilliseconds = milliseconds;
+        queueMicrotask(callback);
+        return undefined;
+      },
+    });
+    expect(scheduledMilliseconds).toBe(2500);
+    expect(kills).toBeGreaterThan(0);
+    expect(result).toMatchObject({ exitCode: 137, timedOut: true, timeoutSeconds: 2.5 });
+    expect(result.preview).toBe("");
+    expect(result.stderr).toBe("");
+  });
+
   test("rejects macOS MXC timeouts below the native launch floor", async () => {
     const mod = await loadContract("execution");
     const execute = requiredExport<ExecuteShell>(mod, "executeShell");
@@ -615,9 +807,27 @@ describe("pipe, PTY, cancellation, and failure lifecycle", () => {
     const mod = await loadContract("execution");
     const execute = requiredExport<ExecuteShell>(mod, "executeShell");
     const events: string[] = [];
-    const result = await execute({ shell: "bash", command: "touch /tmp/host", spawn: async () => { events.push("mxc"); throw new Error("launch failed"); }, chooseFailure: async (choices: string[]) => { events.push(...choices); return "Cancel"; }, executeHost: async () => events.push("host") });
+    let failure: Record<string, unknown> | undefined;
+    const result = await execute({ platform: "win32", shell: "bash", command: "touch /tmp/host", spawn: async () => { events.push("mxc"); throw Object.assign(new Error("name too long"), { code: "ENAMETOOLONG" }); }, chooseFailure: async (choices: string[], details: Record<string, unknown>) => { events.push(...choices); failure = details; return "Cancel"; }, executeHost: async () => events.push("host") });
     expect(result).toMatchObject({ cancelled: true, launchFailed: true });
     expect(events).toEqual(["mxc", "Retry sandbox", "Run this command outside once", "Disable sandbox for this conversation", "Cancel"]);
+    expect(failure).toMatchObject({ name: "Error", message: "name too long", code: "ENAMETOOLONG" });
+  });
+
+  test("preserves the one-argument Unix launch-failure callback", async () => {
+    const mod = await loadContract("execution");
+    const execute = requiredExport<ExecuteShell>(mod, "executeShell");
+    let argumentCount = 0;
+    const result = await execute({
+      platform: "linux",
+      shell: "bash",
+      configuredShell: "/bin/bash",
+      command: "false",
+      spawn: async () => { throw new Error("launch failed"); },
+      chooseFailure: async (...arguments_: unknown[]) => { argumentCount = arguments_.length; return "Cancel"; },
+    });
+    expect(result).toMatchObject({ cancelled: true, launchFailed: true });
+    expect(argumentCount).toBe(1);
   });
 });
 

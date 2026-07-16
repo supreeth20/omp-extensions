@@ -80,7 +80,7 @@ function invokeProductionExtensionFactory(): { commands: string[]; tools: string
     pi: {},
   };
   mxcSandboxExtension(api);
-  if (!commands.includes("sandbox") || !tools.includes("sandbox_request") || !tools.includes("sandbox_run") || !events.includes("session_start")) {
+  if (!commands.includes("sandbox") || !tools.includes("sandbox_request") || !events.includes("session_start")) {
     throw driverError("PRODUCTION_EXTENSION_FACTORY_INCOMPLETE", "The production extension factory did not register its required OMP surface", { commands, tools, events });
   }
   return { commands, tools, events };

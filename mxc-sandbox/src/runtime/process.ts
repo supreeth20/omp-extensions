@@ -1,4 +1,6 @@
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
+import { delimiter, dirname, join } from "node:path";
 import type { ShellLaunch } from "../mxc/config";
 import { buildProcessConfig } from "../mxc/config";
 import { spawnMxcFromInvocation } from "../mxc/sdk";
@@ -8,6 +10,7 @@ import { prepareSandboxEnvironment } from "../policy/environment";
 import { createLosslessArtifactSink, type LosslessArtifactSink } from "./artifacts";
 import { registerMxcJob } from "./jobs";
 import { renderMxcOutput } from "./output";
+const WINDOWS_DACL_SETUP_GRACE_MS = 30_000;
 
 type UnknownRecord = Record<string, unknown>;
 type StreamEvents = { stdout(data: string | Uint8Array): void; stderr(data: string | Uint8Array): void };
@@ -40,6 +43,33 @@ function baseName(path: string): string {
   return path.replaceAll("\\", "/").split("/").at(-1)?.toLowerCase() ?? "";
 }
 
+function findWindowsExecutable(name: "bash.exe" | "pwsh.exe", discovered: string[], input: UnknownRecord): string | undefined {
+  const environment = input.environment && typeof input.environment === "object" && !Array.isArray(input.environment)
+    ? input.environment as Record<string, unknown>
+    : process.env;
+  const supplied = discovered.find((path) => baseName(path) === name);
+  const pathCandidates = String(environment.PATH ?? "")
+    .split(delimiter)
+    .map((directory) => directory.trim().replace(/^"|"$/g, ""))
+    .filter(Boolean)
+    .map((directory) => join(directory, name));
+  const programRoots = [environment.ProgramW6432, environment.ProgramFiles]
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+  const fixedCandidates = name === "pwsh.exe"
+    ? [
+        ...(typeof environment.LOCALAPPDATA === "string" ? [join(environment.LOCALAPPDATA, "Programs", "PowerShell", "7-preview", name)] : []),
+        ...(supplied ? [supplied] : []),
+        ...pathCandidates,
+        ...programRoots.map((root) => join(root, "PowerShell", "7", name)),
+      ]
+    : [
+        ...(supplied ? [supplied] : []),
+        ...programRoots.flatMap((root) => [join(root, "Git", "bin", name), join(root, "Git", "usr", "bin", name)]),
+        ...(typeof environment.LOCALAPPDATA === "string" ? [join(environment.LOCALAPPDATA, "Programs", "Git", "bin", name)] : []),
+      ];
+  return fixedCandidates.find(existsSync);
+}
+
 export function createContainerId(): string {
   return `mxc-${randomBytes(24).toString("base64url")}`;
 }
@@ -49,19 +79,19 @@ export function resolveShell(input: UnknownRecord): ShellLaunch & { dialect: "po
   const requested = input.requested === "powershell" ? "powershell" : "bash";
   const discovered = Array.isArray(input.discovered) ? input.discovered.filter((item): item is string => typeof item === "string") : [];
   if (requested === "powershell") {
-    const executable = discovered.find((path) => baseName(path) === "pwsh.exe");
+    const executable = platform === "win32" ? findWindowsExecutable("pwsh.exe", discovered, input) : undefined;
     if (platform !== "win32" || !executable) {
       throw new ExecutionError("POWERSHELL_7_REQUIRED", "PowerShell 7 (pwsh.exe) is required and is never auto-installed", { autoInstall: false });
     }
     return {
       executable,
       dialect: "powershell7",
-      args: ["-NoLogo", "-NoProfile", "-Command"],
+      args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command"],
       ui: { allowWindows: true, clipboardRead: false, clipboardWrite: false, inputInjection: false },
     };
   }
   if (platform === "win32") {
-    const executable = discovered.find((path) => baseName(path) === "bash.exe");
+    const executable = findWindowsExecutable("bash.exe", discovered, input);
     if (!executable) throw new ExecutionError("POSIX_BASH_REQUIRED", "A discovered POSIX-compatible bash.exe, such as Git Bash, is required");
     return { executable, dialect: "posix", args: ["-lc"] };
   }
@@ -87,6 +117,19 @@ function resolvedShell(input: UnknownRecord): ShellLaunch {
     configuredShell: input.configuredShell,
     discovered: input.discovered,
   });
+}
+
+function shellExecutionPolicy(value: unknown, shell: ShellLaunch, platform: string): UnknownRecord {
+  const policy = structuredClone(record(value));
+  if (platform !== "win32" || shell.dialect !== "powershell7") return policy;
+  const filesystem = record(policy.filesystem);
+  const read = Array.isArray(filesystem.read) ? [...filesystem.read] : [];
+  const runtimeDirectories = [dirname(shell.executable), join(process.env.SystemRoot ?? "C:\\Windows", "System32")];
+  const existing = new Set(read.map((entry) => typeof entry === "string" ? entry.toLowerCase() : String(record(entry).path ?? "").toLowerCase()));
+  for (const path of runtimeDirectories) {
+    if (!existing.has(path.toLowerCase())) read.push({ path, kind: "directory", recursive: true });
+  }
+  return { ...policy, filesystem: { ...filesystem, read } };
 }
 
 function killReturned(processHandle: unknown): void {
@@ -157,9 +200,23 @@ export function createMxcPtyBridge(input: UnknownRecord): UnknownRecord {
   };
 }
 
+function launchFailureDetails(error: unknown): UnknownRecord {
+  if (!(error instanceof Error)) return { message: String(error) };
+  const value = record(error);
+  return {
+    name: error.name,
+    message: error.message,
+    ...(typeof value.code === "string" || typeof value.code === "number" ? { code: value.code } : {}),
+    ...(value.details && typeof value.details === "object" ? { details: value.details } : {}),
+  };
+}
+
 async function chooseLaunchFailure(input: UnknownRecord, error: unknown): Promise<UnknownRecord | "retry"> {
   if (typeof input.chooseFailure !== "function") throw error;
-  const choice = await input.chooseFailure(["Retry sandbox", "Run this command outside once", "Disable sandbox for this conversation", "Cancel"]);
+  const choices = ["Retry sandbox", "Run this command outside once", "Disable sandbox for this conversation", "Cancel"];
+  const choice = (typeof input.platform === "string" ? input.platform : process.platform) === "win32"
+    ? await input.chooseFailure(choices, launchFailureDetails(error))
+    : await input.chooseFailure(choices);
   if (choice === "Retry sandbox") return "retry";
   if (choice === "Run this command outside once") {
     const outside = await executeOutsideOnce({
@@ -211,10 +268,10 @@ export function sandboxDenialGuidance(input: UnknownRecord): UnknownRecord | und
     denied: true,
     kind: restrictedNetworkAttempt ? "network" : "filesystem-or-network",
     shell: input.shell === "powershell" ? "powershell" : "bash",
-    nextTool: "sandbox_run",
+    nextTool: "sandbox_request",
     capabilities: ["read", "write", "allowed-host", "internet", "local-network"],
     ...(suggestedCapability ? { suggestedCapability } : {}),
-    instruction: "Do not retry the same shell command unchanged. Use sandbox_run with the required capabilities to request permission and execute atomically, or call sandbox_request before retrying bash/powershell.",
+    instruction: "Do not retry the same shell command unchanged. Request the required capability with sandbox_request, then retry bash/powershell after approval.",
   };
 }
 
@@ -231,20 +288,30 @@ export async function executeShell(input: UnknownRecord): Promise<UnknownRecord>
   await confirmCriticalCommand({ shell: input.shell, command: input.command, cwd: input.cwd, confirm: input.confirmCritical });
   const started = Date.now();
   const shell = resolvedShell(input);
+  const runtimePlatform = typeof input.platform === "string" ? input.platform : process.platform;
+  const executionPolicy = shellExecutionPolicy(input.policy, shell, runtimePlatform);
   const containerId = createContainerId();
   const requestedPty = input.pty === true;
   const hasInteractiveOverlay = input.hasInteractiveOverlay === true;
   const ptySupported = record(input.platformCapabilities).pty !== false;
   const usePty = requestedPty && hasInteractiveOverlay && ptySupported;
-  const notices = requestedPty && !hasInteractiveOverlay
+  const notices: string[] = requestedPty && !hasInteractiveOverlay
     ? ["PTY requested in a headless context; running in MXC pipe mode."]
     : requestedPty && !ptySupported
       ? ["PTY is unsupported by this MXC backend; running in contained pipe mode."]
       : [];
-  const timeoutMs = typeof input.timeout === "number" && Number.isFinite(input.timeout) && input.timeout > 0
+  const requestedTimeoutMs = typeof input.timeout === "number" && Number.isFinite(input.timeout) && input.timeout > 0
     ? input.timeout * 1000
     : undefined;
-  if ((input.platform ?? process.platform) === "darwin" && timeoutMs !== undefined && timeoutMs < 500) {
+  const daclCompatibility = runtimePlatform === "win32"
+    && record(record(executionPolicy.mxcOverrides).fallback).allowDaclMutation === true;
+  const timeoutMs = requestedTimeoutMs === undefined
+    ? undefined
+    : requestedTimeoutMs + (daclCompatibility ? WINDOWS_DACL_SETUP_GRACE_MS : 0);
+  const readyMarker = runtimePlatform === "win32" && shell.dialect === "powershell7" && requestedTimeoutMs !== undefined
+    ? `__OMP_MXC_READY_${containerId}__`
+    : undefined;
+  if (runtimePlatform === "darwin" && timeoutMs !== undefined && timeoutMs < 500) {
     throw new ExecutionError("MXC_TIMEOUT_BELOW_PLATFORM_MINIMUM", "macOS MXC 0.7 requires a timeout of at least 0.5 seconds");
   }
   const environmentPolicy = record(input.environmentPolicy);
@@ -259,10 +326,12 @@ export async function executeShell(input: UnknownRecord): Promise<UnknownRecord>
   });
   const config = buildInvocationConfig({
     ...input,
-    platform: input.platform ?? process.platform,
+    platform: runtimePlatform,
     shell,
+    policy: executionPolicy,
     containerId,
     timeoutMs,
+    readyMarker,
     env,
     usePty,
   });
@@ -274,13 +343,39 @@ export async function executeShell(input: UnknownRecord): Promise<UnknownRecord>
   let outputClosed = false;
   const sessionManager = record(input.sessionManager);
   if (typeof sessionManager.allocateArtifactPath === "function") artifactSink = await createLosslessArtifactSink(sessionManager, input.shell === "powershell" ? "powershell" : "bash");
+  let commandReady = readyMarker === undefined;
+  let readyMarkerPending = readyMarker !== undefined;
+  let readyMarkerBuffer = "";
+  let startRequestedTimeout = (): void => {};
+  const markCommandReady = (): void => {
+    if (commandReady) return;
+    commandReady = true;
+    startRequestedTimeout();
+  };
+  const appendOutput = (stream: "stdout" | "stderr", text: string): void => {
+    if (text.length === 0 || outputClosed) return;
+    outputEvents.push({ sequence: ++outputSequence, stream, data: text });
+    (stream === "stdout" ? stdout : stderr).push(text);
+    artifactSink?.write(new TextEncoder().encode(text));
+    if (typeof input.onUpdate === "function") input.onUpdate({ stream, data: text });
+  };
   const pushOutput = (stream: "stdout" | "stderr", data: string | Uint8Array): void => {
     if (outputClosed) return;
-    outputEvents.push({ sequence: ++outputSequence, stream, data });
     const text = typeof data === "string" ? data : new TextDecoder().decode(data);
-    (stream === "stdout" ? stdout : stderr).push(text);
-    artifactSink?.write(typeof data === "string" ? new TextEncoder().encode(data) : data);
-    if (typeof input.onUpdate === "function") input.onUpdate({ stream, data: text });
+    if (stream === "stdout") markCommandReady();
+    if (stream === "stderr" && readyMarkerPending && readyMarker) {
+      readyMarkerBuffer += text;
+      const markerIndex = readyMarkerBuffer.indexOf(readyMarker);
+      if (markerIndex < 0) return;
+      const before = readyMarkerBuffer.slice(0, markerIndex).replace(/^DACL recovery:.*(?:\r?\n|$)/gm, "");
+      const after = readyMarkerBuffer.slice(markerIndex + readyMarker.length).replace(/^\r?\n/, "");
+      readyMarkerBuffer = "";
+      readyMarkerPending = false;
+      markCommandReady();
+      appendOutput("stderr", `${before}${after}`);
+      return;
+    }
+    appendOutput(stream, text);
   };
   const streamEvents: StreamEvents = {
     stdout: (data) => pushOutput("stdout", data),
@@ -330,13 +425,19 @@ export async function executeShell(input: UnknownRecord): Promise<UnknownRecord>
     terminationRequested = false;
     cancel();
   }
-  const timeoutTimer: Timer | undefined = timeoutMs === undefined
-    ? undefined
-    : setTimeout(() => {
-        timedOut = true;
-        killReturned(spawned);
-        forcedExit.resolve({ exitCode: 137, timedOut: true });
-      }, timeoutMs);
+  const scheduleTimeout = typeof input.scheduleTimeout === "function"
+    ? input.scheduleTimeout as (callback: () => void, milliseconds: number) => number | Timer
+    : setTimeout;
+  let timeoutTimer: number | Timer | undefined;
+  startRequestedTimeout = (): void => {
+    if (requestedTimeoutMs === undefined || timeoutTimer !== undefined) return;
+    timeoutTimer = scheduleTimeout(() => {
+      timedOut = true;
+      killReturned(spawned);
+      forcedExit.resolve({ exitCode: 137, timedOut: true });
+    }, requestedTimeoutMs);
+  };
+  if (commandReady) startRequestedTimeout();
 
   let finalized = false;
   const finalize = async (result: UnknownRecord): Promise<UnknownRecord> => {
@@ -349,14 +450,20 @@ export async function executeShell(input: UnknownRecord): Promise<UnknownRecord>
       if (typeof result.stdout === "string" && result.stdout.length > 0) pushOutput("stdout", result.stdout);
       if (typeof result.stderr === "string" && result.stderr.length > 0) pushOutput("stderr", result.stderr);
     }
+    if (readyMarkerPending && readyMarkerBuffer.length > 0) {
+      readyMarkerPending = false;
+      appendOutput("stderr", readyMarkerBuffer);
+      readyMarkerBuffer = "";
+    }
     outputClosed = true;
     await artifactSink?.close();
+    const wallTimeMs = typeof result.wallTimeMs === "number" ? result.wallTimeMs : Date.now() - started;
     const rendered = await renderMxcOutput({
       events: outputEvents,
       exitCode: result.exitCode,
       timedOut: result.timedOut === true || timedOut,
       cancelled: result.cancelled === true || cancelled,
-      wallTimeMs: typeof result.wallTimeMs === "number" ? result.wallTimeMs : Date.now() - started,
+      wallTimeMs,
       maxColumns: input.maxColumns,
       maxLines: input.maxLines,
       ...(artifactSink ? { artifact: `artifact://${artifactSink.allocation.id}` } : {}),
@@ -381,10 +488,12 @@ export async function executeShell(input: UnknownRecord): Promise<UnknownRecord>
     const finalResult = {
       ...result,
       ...rendered,
-      stdout: typeof result.stdout === "string" ? result.stdout : stdout.join(""),
-      stderr: typeof result.stderr === "string" ? result.stderr : stderr.join(""),
+      wallTimeMs,
+      stdout: stdout.join(""),
+      stderr: stderr.join(""),
       containerId,
       notices,
+      ...(requestedTimeoutMs === undefined ? {} : { timeoutSeconds: requestedTimeoutMs / 1000 }),
     };
     if (typeof input.renderer === "function") {
       await input.renderer({ content: [{ type: "text", text: String(rendered.preview ?? "") }], details: finalResult });
