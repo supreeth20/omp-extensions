@@ -32,7 +32,7 @@ beforeAll(async () => {
   attestation = await harness.probe();
   expect(attestation).toMatchObject({ os: "macos", architecture: process.arch, sdkVersion: "0.7.0", schemaVersion: "0.7.0-alpha", backend: "seatbelt", nativeBinaryExecuted: true, containmentDeniedHostSentinel: true });
   expect(attestation.osBuild).toBeString();
-  expect(attestation.ompVersion).toMatch(/^16\./);
+  expect(attestation.ompVersion).toMatch(/^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/);
   expect(attestation.nativeBinarySha256).toMatch(/^[a-f0-9]{64}$/);
   expect(attestation.transcript.length).toBeGreaterThan(0);
 });

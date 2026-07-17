@@ -1,6 +1,6 @@
 import { homedir, tmpdir } from "node:os";
 import { release } from "node:os";
-import { basename, delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join, win32 } from "node:path";
 import { mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { PermissionBroker } from "./src/broker/permission-broker";
@@ -858,7 +858,7 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
           : configuredShell;
         const shell = runtimePlatform === "win32"
           ? {
-              executable: join(process.env.SystemRoot ?? "C:\\Windows", "System32", "cmd.exe"),
+              executable: win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "cmd.exe"),
               args: ["/d", "/s", "/c"],
               dialect: "cmd",
               ui: { allowWindows: false, clipboardRead: false, clipboardWrite: false, inputInjection: false },
@@ -869,7 +869,7 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
         const capabilities = recordValue(requested.platformCapabilities);
         const compatibility = requested.windowsMode === "compatibility" && requested.allowDaclMutation === true;
         const shellRead = runtimePlatform === "win32"
-          ? { path: dirname(shell.executable), kind: "directory", recursive: true }
+          ? { path: win32.dirname(shell.executable), kind: "directory", recursive: true }
           : { path: shell.executable, kind: "file" };
         const probeInput = {
           ...(runtimePlatform === "win32"
@@ -877,7 +877,7 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
                 containerId: createContainerId(),
                 trafficShell,
                 env: buildSandboxEnvironment(hostEnvironment, {}),
-                requiredReadonlyPaths: [...new Set([dirname(configuredShell.executable), dirname(trafficShell.executable)])],
+                requiredReadonlyPaths: [...new Set([win32.dirname(configuredShell.executable), win32.dirname(trafficShell.executable)])],
               }
             : { env: { PATH: process.env.PATH ?? "" } }),
           platform: runtimePlatform,

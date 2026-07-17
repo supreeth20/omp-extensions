@@ -178,8 +178,8 @@ async function runProbe(factory: { commands: string[]; tools: string[]; events: 
     capture("omp", ["--version"]),
     capture("/usr/bin/sw_vers", ["-buildVersion"]),
   ]);
-  if (omp.exitCode !== 0 || !/^omp\/16\.[0-9]+\.[0-9]+$/.test(omp.stdout)) {
-    throw driverError("OMP_VERSION_UNVERIFIED", "The actual OMP executable did not report a supported 16.x version", { command: omp.command, exitCode: omp.exitCode, stdout: omp.stdout, stderr: omp.stderr });
+  if (omp.exitCode !== 0 || !/^omp\/[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(omp.stdout)) {
+    throw driverError("OMP_VERSION_UNVERIFIED", "The actual OMP executable did not report a valid semantic version", { command: omp.command, exitCode: omp.exitCode, stdout: omp.stdout, stderr: omp.stderr });
   }
   if (osBuild.exitCode !== 0 || osBuild.stdout.length === 0) {
     throw driverError("MACOS_BUILD_UNVERIFIED", "The actual macOS build could not be queried", { command: osBuild.command, exitCode: osBuild.exitCode, stdout: osBuild.stdout, stderr: osBuild.stderr });

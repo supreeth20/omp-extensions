@@ -808,7 +808,7 @@ describe("pipe, PTY, cancellation, and failure lifecycle", () => {
     const execute = requiredExport<ExecuteShell>(mod, "executeShell");
     const events: string[] = [];
     let failure: Record<string, unknown> | undefined;
-    const result = await execute({ platform: "win32", shell: "bash", command: "touch /tmp/host", spawn: async () => { events.push("mxc"); throw Object.assign(new Error("name too long"), { code: "ENAMETOOLONG" }); }, chooseFailure: async (choices: string[], details: Record<string, unknown>) => { events.push(...choices); failure = details; return "Cancel"; }, executeHost: async () => events.push("host") });
+    const result = await execute({ platform: "win32", shell: "bash", discovered: ["C:\\Program Files\\Git\\bin\\bash.exe"], command: "touch /tmp/host", spawn: async () => { events.push("mxc"); throw Object.assign(new Error("name too long"), { code: "ENAMETOOLONG" }); }, chooseFailure: async (choices: string[], details: Record<string, unknown>) => { events.push(...choices); failure = details; return "Cancel"; }, executeHost: async () => events.push("host") });
     expect(result).toMatchObject({ cancelled: true, launchFailed: true });
     expect(events).toEqual(["mxc", "Retry sandbox", "Run this command outside once", "Disable sandbox for this conversation", "Cancel"]);
     expect(failure).toMatchObject({ name: "Error", message: "name too long", code: "ENAMETOOLONG" });

@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, join, win32 } from "node:path";
 import type { ShellLaunch } from "../mxc/config";
 import { buildProcessConfig } from "../mxc/config";
 import { spawnMxcFromInvocation } from "../mxc/sdk";
@@ -48,25 +48,30 @@ function findWindowsExecutable(name: "bash.exe" | "pwsh.exe", discovered: string
     ? input.environment as Record<string, unknown>
     : process.env;
   const supplied = discovered.find((path) => baseName(path) === name);
+  const pathDelimiter = process.platform === "win32" ? win32.delimiter : delimiter;
+  const candidateJoin = (root: string, ...segments: string[]): string => process.platform === "win32" || !root.startsWith("/")
+    ? win32.join(root, ...segments)
+    : join(root, ...segments);
   const pathCandidates = String(environment.PATH ?? "")
-    .split(delimiter)
+    .split(pathDelimiter)
     .map((directory) => directory.trim().replace(/^"|"$/g, ""))
     .filter(Boolean)
-    .map((directory) => join(directory, name));
+    .map((directory) => candidateJoin(directory, name));
   const programRoots = [environment.ProgramW6432, environment.ProgramFiles]
     .filter((value): value is string => typeof value === "string" && value.length > 0);
   const fixedCandidates = name === "pwsh.exe"
     ? [
-        ...(typeof environment.LOCALAPPDATA === "string" ? [join(environment.LOCALAPPDATA, "Programs", "PowerShell", "7-preview", name)] : []),
+        ...(typeof environment.LOCALAPPDATA === "string" ? [candidateJoin(environment.LOCALAPPDATA, "Programs", "PowerShell", "7-preview", name)] : []),
         ...(supplied ? [supplied] : []),
         ...pathCandidates,
-        ...programRoots.map((root) => join(root, "PowerShell", "7", name)),
+        ...programRoots.map((root) => candidateJoin(root, "PowerShell", "7", name)),
       ]
     : [
         ...(supplied ? [supplied] : []),
-        ...programRoots.flatMap((root) => [join(root, "Git", "bin", name), join(root, "Git", "usr", "bin", name)]),
-        ...(typeof environment.LOCALAPPDATA === "string" ? [join(environment.LOCALAPPDATA, "Programs", "Git", "bin", name)] : []),
+        ...programRoots.flatMap((root) => [candidateJoin(root, "Git", "bin", name), candidateJoin(root, "Git", "usr", "bin", name)]),
+        ...(typeof environment.LOCALAPPDATA === "string" ? [candidateJoin(environment.LOCALAPPDATA, "Programs", "Git", "bin", name)] : []),
       ];
+  if (process.platform !== "win32" && supplied) return supplied;
   return fixedCandidates.find(existsSync);
 }
 
@@ -124,7 +129,7 @@ function shellExecutionPolicy(value: unknown, shell: ShellLaunch, platform: stri
   if (platform !== "win32" || shell.dialect !== "powershell7") return policy;
   const filesystem = record(policy.filesystem);
   const read = Array.isArray(filesystem.read) ? [...filesystem.read] : [];
-  const runtimeDirectories = [dirname(shell.executable), join(process.env.SystemRoot ?? "C:\\Windows", "System32")];
+  const runtimeDirectories = [win32.dirname(shell.executable), win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32")];
   const existing = new Set(read.map((entry) => typeof entry === "string" ? entry.toLowerCase() : String(record(entry).path ?? "").toLowerCase()));
   for (const path of runtimeDirectories) {
     if (!existing.has(path.toLowerCase())) read.push({ path, kind: "directory", recursive: true });

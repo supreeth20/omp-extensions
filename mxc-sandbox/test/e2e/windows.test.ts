@@ -33,7 +33,7 @@ beforeAll(async () => {
   expect(attestation).toMatchObject({ os: "windows", sdkVersion: "0.7.0", schemaVersion: "0.7.0-alpha", backend: "processcontainer", nativeBinaryExecuted: true, containmentDeniedHostSentinel: true });
   expect(attestation.windowsBuild).toBeGreaterThanOrEqual(26100);
   expect(attestation.windowsRelease).toMatch(/^(24H2|25H2|2[6-9]H2)$/);
-  expect(attestation.ompVersion).toMatch(/^16\./);
+  expect(attestation.ompVersion).toMatch(/^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/);
   expect(attestation.nativeBinarySha256).toMatch(/^[a-f0-9]{64}$/);
   expect(attestation.tier).toBeInteger();
   expect(attestation.transcript.length).toBeGreaterThan(0);

@@ -1,5 +1,5 @@
 import { networkInterfaces } from "node:os";
-import { dirname } from "node:path";
+import { dirname, win32 } from "node:path";
 import { createServer } from "node:net";
 import { loadMxcSdk, spawnMxcFromInvocation, spawnMxcTrafficProbeFromInvocation } from "./sdk";
 
@@ -144,8 +144,8 @@ export function selectProbeRuntimeReadonlyPaths(input: UnknownRecord): string[] 
   const candidates = [
     ...sdkPaths,
     ...requestedPaths,
-    ...(typeof input.shellExecutable === "string" ? [dirname(input.shellExecutable)] : []),
-    ...(typeof input.spawnfile === "string" ? [dirname(input.spawnfile)] : []),
+    ...(typeof input.shellExecutable === "string" ? [platform === "win32" ? win32.dirname(input.shellExecutable) : dirname(input.shellExecutable)] : []),
+    ...(typeof input.spawnfile === "string" ? [platform === "win32" ? win32.dirname(input.spawnfile) : dirname(input.spawnfile)] : []),
   ];
   return candidates.filter((path, index, paths) => path.length > 0 && paths.indexOf(path) === index);
 }

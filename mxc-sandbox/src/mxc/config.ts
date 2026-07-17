@@ -1,5 +1,5 @@
 import { stat } from "node:fs/promises";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import { canonicalizeTarget } from "../policy/paths";
 import { assertMacosSeatbeltPolicy } from "../platform/macos";
 import { assertWindowsNetworkPolicy } from "../platform/windows";
@@ -134,7 +134,7 @@ function processCommandLine(shell: ShellLaunch, command: string, cwd: string, pl
   const readySignal = readyMarker ? `[Console]::Error.WriteLine('${readyMarker.replaceAll("'", "''")}'); [Console]::Error.Flush(); ` : "";
   const bootstrap = `New-PSDrive -Name MXC -PSProvider FileSystem -Root '${workingDirectoryLiteral}' | Out-Null; Set-Location MXC:\\; [Environment]::CurrentDirectory='${workingDirectoryLiteral}'; ${removeItemCompatibility}; $script=[ScriptBlock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${userCommand}'))); ${readySignal}& $script; $success=$?; if($LASTEXITCODE -is [int]){exit $LASTEXITCODE}; if(-not $success){exit 1}`;
   const launcher = `${executable} ${powershellArguments} -EncodedCommand ${Buffer.from(bootstrap, "utf16le").toString("base64")}`;
-  return [join(process.env.SystemRoot ?? "C:\\Windows", "System32", "cmd.exe"), "/d", "/s", "/c", launcher];
+  return [win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "cmd.exe"), "/d", "/s", "/c", launcher];
 }
 
 function buildProcessConfigInternal(input: Record<string, unknown>, internalTrafficProbe: boolean): MxcInvocationConfig {
