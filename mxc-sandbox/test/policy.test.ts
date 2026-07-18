@@ -221,8 +221,14 @@ describe("environment, tool, network, and UI policy", () => {
     expect(classify({ name: "read", input: { path: "archive.zip:dir/a.txt" }, enabled: true }).gateTarget).toBe("archive.zip");
     expect(classify({ name: "read", input: { path: "data.db:users:42" }, enabled: true }).gateTarget).toBe("data.db");
     expect(classify({ name: "read", input: { path: "https://example.com/a" }, enabled: true }).initialHost).toBe("example.com");
-    expect(classify({ name: "write", input: { path: "ssh://host/file" }, enabled: true })).toMatchObject({ action: "block", reason: "unsupported-scheme" });
-    expect(classify({ name: "read", input: { path: "artifact://ABC" }, enabled: true }).action).toBe("allow-internal");
+    expect(classify({ name: "write", input: { path: "vendor://unknown" }, enabled: true })).toMatchObject({ action: "block", reason: "unsupported-scheme" });
+    for (const path of ["artifact://ABC", "history://A1", "mcp://resource", "xd://sandbox_request"]) {
+      expect(classify({ name: "read", input: { path }, enabled: true })).toMatchObject({ action: "allow-internal", trustedInternal: path });
+      expect(classify({ name: "write", input: { path }, enabled: true })).toMatchObject({ action: "allow-internal", trustedInternal: path });
+    }
+    expect(classify({ name: "read", input: { path: "ssh://user@example.com/a" }, enabled: true, policy: { network: { allowedHosts: ["example.com"] } } })).toMatchObject({ action: "allow-host-adapter", initialHost: "example.com" });
+    expect(classify({ name: "read", input: { path: "ssh://user@example.com/a" }, enabled: true, policy: {} })).toMatchObject({ action: "block", reason: "network-host-not-granted" });
+    expect(classify({ name: "read", input: { path: "vault://secret" }, enabled: true, policy: {} })).toMatchObject({ action: "block", reason: "vault-access-requires-sandbox-disable" });
   });
 
   test("requires unrestricted internet for web search and initial-host permission for browser/read", async () => {

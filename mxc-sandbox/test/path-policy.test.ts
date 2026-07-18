@@ -162,8 +162,21 @@ describe("grant boundaries and host file-tool targets", () => {
     expect(targets("read", { path: "/repo/a.zip:dir/file" })).toEqual([{ path: "/repo/a.zip", operation: "read", compound: "archive" }]);
     expect(targets("read", { path: "/repo/data.sqlite:users:42" })).toEqual([{ path: "/repo/data.sqlite", operation: "read", compound: "sqlite" }]);
     expect(targets("read", { path: "https://example.com/a" })).toEqual([{ host: "example.com", operation: "network", redirectPolicy: "initial-host-only" }]);
-    expect(targets("read", { path: "artifact://A1" })).toEqual([{ trustedInternal: "artifact://A1" }]);
-    expect(targets("write", { path: "ssh://host/a" })).toEqual([{ blocked: true, reason: "unsupported-scheme" }]);
+    const internalTargets = [
+      "artifact://A1", "agent://A1", "skill://domain-modeling", "local://context.txt", "memory://key",
+      "rule://policy", "omp://", "issue://1", "pr://1", "history://A1", "mcp://resource",
+      "xd://sandbox_request", "xd://resolve", "xd://reject", "xd://propose",
+    ];
+    for (const target of internalTargets) {
+      expect(targets("read", { path: target })).toEqual([{ trustedInternal: target, internalWrite: true }]);
+      expect(targets("write", { path: target })).toEqual([{ trustedInternal: target, internalWrite: true }]);
+    }
+    expect(targets("read", { path: "ssh://user@example.com/a" })).toEqual([{ host: "example.com", operation: "network", remoteInternal: "ssh://user@example.com/a" }]);
+    expect(targets("write", { path: "ssh://user@example.com/a" })).toEqual([{ host: "example.com", operation: "network", remoteInternal: "ssh://user@example.com/a" }]);
+    expect(targets("read", { path: "vault://secret" })).toEqual([{ blocked: true, reason: "vault-access-requires-sandbox-disable" }]);
+    expect(targets("write", { path: "vault://secret" })).toEqual([{ blocked: true, reason: "vault-access-requires-sandbox-disable" }]);
+    expect(targets("write", { path: "conflict://C1" })).toEqual([{ trustedInternal: "conflict://C1", internalWrite: true }]);
+    expect(targets("write", { path: "vendor://unknown" })).toEqual([{ blocked: true, reason: "unsupported-scheme" }]);
   });
 
   test("keeps readonly LSP available and warns before broad non-readonly actions", async () => {

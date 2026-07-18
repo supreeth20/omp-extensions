@@ -269,7 +269,7 @@ export async function interceptToolCall(
     const grants = policyGrants(policy);
     const workspace = typeof context.workspace === "string" ? context.workspace : typeof context.cwd === "string" ? context.cwd : process.cwd();
     const evaluations = await Promise.all(targets.map(async (target) => {
-      if (target.trustedInternal) return { allowed: operation === "read", target };
+      if (target.trustedInternal) return { allowed: operation === "read" || target.internalWrite === true, target };
       if (typeof target.path !== "string") return { allowed: false, target };
       const requestedPath = isAbsolute(target.path) ? normalize(target.path) : resolve(workspace, target.path);
       const resolvedTarget = { ...target, path: requestedPath };

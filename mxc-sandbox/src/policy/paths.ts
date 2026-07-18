@@ -43,9 +43,52 @@ export function canonicalizeWindowsPath(target: string): string {
   return normalized.length > root.length ? normalized.replace(/[\\]+$/, "") : normalized;
 }
 
+export const OMP_INTERNAL_URL_REGISTRY_VERSION = "17.0.4";
+
+const OMP_INTERNAL_URL_SCHEMES = new Set([
+  "agent", "artifact", "history", "issue", "local", "mcp", "memory",
+  "omp", "pr", "rule", "skill", "ssh", "vault", "xd",
+]);
+
+const POLICY_GATED_INTERNAL_URL_SCHEMES = new Set(["ssh", "vault"]);
+
+
+function urlScheme(target: string): string | undefined {
+  const separator = target.indexOf("://");
+  return separator > 0 ? target.slice(0, separator).toLowerCase() : undefined;
+}
+
+function isOmpInternalUrl(target: string): boolean {
+  const scheme = urlScheme(target);
+  return scheme !== undefined && OMP_INTERNAL_URL_SCHEMES.has(scheme);
+}
+function isTrustedOmpInternalUrl(target: string): boolean {
+  const scheme = urlScheme(target);
+  return scheme !== undefined && OMP_INTERNAL_URL_SCHEMES.has(scheme) && !POLICY_GATED_INTERNAL_URL_SCHEMES.has(scheme);
+}
+
+function classifySshTarget(target: string): ToolTarget {
+  try {
+    const parsed = new URL(target);
+    return parsed.hostname.length > 0
+      ? { host: parsed.hostname, operation: "network", remoteInternal: target }
+      : { blocked: true, reason: "invalid-ssh-url" };
+  } catch {
+    return { blocked: true, reason: "invalid-ssh-url" };
+  }
+}
+
+function classifyPolicyGatedInternalTarget(target: string, scheme: string | undefined): ToolTarget | undefined {
+  if (scheme === "ssh") return classifySshTarget(target);
+  if (scheme === "vault") return { blocked: true, reason: "vault-access-requires-sandbox-disable" };
+  return undefined;
+}
+
+
+
 function classifyReadPath(target: string): ToolTarget {
-  const urlMatch = target.match(/^https?:\/\//i);
-  if (urlMatch) {
+  const scheme = urlScheme(target);
+  if (scheme === "http" || scheme === "https") {
     try {
       const parsed = new URL(target);
       return { host: parsed.hostname, operation: "network", redirectPolicy: "initial-host-only" };
@@ -53,8 +96,10 @@ function classifyReadPath(target: string): ToolTarget {
       return { blocked: true, reason: "invalid-url" };
     }
   }
-  if (/^(artifact|agent|skill|local|memory|rule|omp|issue|pr):\/\//i.test(target)) return { trustedInternal: target };
-  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(target)) return { blocked: true, reason: "unsupported-scheme" };
+  const gated = classifyPolicyGatedInternalTarget(target, scheme);
+  if (gated) return gated;
+  if (isTrustedOmpInternalUrl(target)) return { trustedInternal: target, internalWrite: true };
+  if (scheme !== undefined) return { blocked: true, reason: "unsupported-scheme" };
 
   const archive = target.match(/^(.*\.(?:zip|tar|tgz|tar\.gz)):(.+)$/i);
   if (archive) return { path: archive[1], operation: "read", compound: "archive" };
@@ -110,7 +155,11 @@ export function resolveToolTargets(tool: string, input: Record<string, unknown>)
   if (typeof target !== "string") return [{ blocked: true, reason: "missing-target" }];
   if (tool === "read") return [classifyReadPath(target)];
   if (tool === "write") {
-    if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(target)) return [{ blocked: true, reason: "unsupported-scheme" }];
+    const scheme = urlScheme(target);
+    const gated = classifyPolicyGatedInternalTarget(target, scheme);
+    if (gated) return [gated];
+    if (isTrustedOmpInternalUrl(target) || scheme === "conflict") return [{ trustedInternal: target, internalWrite: true }];
+    if (urlScheme(target) !== undefined) return [{ blocked: true, reason: "unsupported-scheme" }];
     return [{ path: target, operation: "write" }];
   }
   return [{ blocked: true, reason: "unsupported-tool" }];

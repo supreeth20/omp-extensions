@@ -11,6 +11,7 @@ import { loadMxcSdk, pruneLegacyDiscoveredPathGrants } from "./src/mxc/sdk";
 import { assertPlatformPolicySupported } from "./src/mxc/config";
 import { buildSandboxEnvironment } from "./src/policy/environment";
 import { resolveNetworkPolicy } from "./src/policy/network";
+import { OMP_INTERNAL_URL_REGISTRY_VERSION } from "./src/policy/paths";
 import { loadProfileLayers, mergePolicyLayers } from "./src/profiles";
 import { activateSandbox, ActivationError, probePublicOmpRuntime } from "./src/runtime/features";
 import { createContainerId, executeShell, expandExecutionWorkingDirectory, resolveShell } from "./src/runtime/process";
@@ -500,6 +501,10 @@ async function promptFromInteractiveContext(context: Record<string, unknown>, re
 export default function mxcSandboxExtension(api: ExtensionApi, dependencies: ExtensionDependencies = {}): void {
   const runtimePlatform = typeof dependencies.platform === "string" ? dependencies.platform : process.platform;
   const profileHome = typeof dependencies.homeDirectory === "string" ? dependencies.homeDirectory : homedir();
+  const pi = recordValue(api.pi);
+  const runtimeOmpVersion = typeof pi.VERSION === "string" ? pi.VERSION : undefined;
+  const internalUrlRegistryDrift = runtimeOmpVersion !== undefined && runtimeOmpVersion !== OMP_INTERNAL_URL_REGISTRY_VERSION;
+  let internalUrlRegistryWarningShown = false;
   const state: StateRecord = {
     enabled: false,
     restorationFailed: false,
@@ -513,6 +518,17 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
     processIdentity: crypto.randomUUID(),
     runtimeReadonlyGrants: [],
   };
+  const internalUrlRegistryStatus = (): Record<string, unknown> => ({
+    synchronizedOmpVersion: OMP_INTERNAL_URL_REGISTRY_VERSION,
+    runtimeOmpVersion: runtimeOmpVersion ?? "unavailable",
+    drift: internalUrlRegistryDrift,
+  });
+  const warnInternalUrlRegistryDrift = (context: Record<string, unknown>): void => {
+    if (!internalUrlRegistryDrift || internalUrlRegistryWarningShown) return;
+    internalUrlRegistryWarningShown = true;
+    notify(context, `OMP ${runtimeOmpVersion} differs from the internal-URL registry verified for OMP ${OMP_INTERNAL_URL_REGISTRY_VERSION}; sandboxing remains enabled, but internal URI routing must be reviewed.`, "warning");
+  };
+
   const updateSandboxIndicator = (context: Record<string, unknown>, clear = false): void => {
     const ui = recordValue(context.ui);
     if (context.hasUI !== true || typeof ui.setWidget !== "function") return;
@@ -1139,6 +1155,7 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
           runtime: { read: Array.isArray(state.runtimeReadonlyGrants) ? structuredClone(state.runtimeReadonlyGrants) : [] },
           platformCapabilities: state.platformCapabilities ?? {},
           profileSources: state.profileSources ?? [],
+          internalUrlRegistry: internalUrlRegistryStatus(),
         };
         const ui = recordValue(context.ui);
         if (typeof ui.select === "function") {
@@ -1146,10 +1163,11 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
           const selected = await ui.select(String(presentation.title), ["User Permissions", "Runtime Executable Access", "Diagnostics", "Close"]);
           if (selected === "User Permissions") await ui.select(`User-configured permissions:\n${JSON.stringify(status.policy, null, 2)}`, ["Back"]);
           else if (selected === "Runtime Executable Access") await ui.select(String(presentation.runtimeTitle), ["Back"]);
-          else if (selected === "Diagnostics") await ui.select(`MXC diagnostics:\n${JSON.stringify({ enabled: status.enabled, restorationFailed: status.restorationFailed, platformCapabilities: status.platformCapabilities, profileSources: status.profileSources }, null, 2)}`, ["Back"]);
+          else if (selected === "Diagnostics") await ui.select(`MXC diagnostics:\n${JSON.stringify({ enabled: status.enabled, restorationFailed: status.restorationFailed, platformCapabilities: status.platformCapabilities, profileSources: status.profileSources, internalUrlRegistry: status.internalUrlRegistry }, null, 2)}`, ["Back"]);
         } else {
           notify(context, `MXC sandbox status:\n${JSON.stringify(status, null, 2)}`, state.restorationFailed === true ? "error" : "info");
         }
+        warnInternalUrlRegistryDrift(context);
         return;
       }
       if (name === "dashboard" || name === "update") {
@@ -1247,6 +1265,7 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
           await resolveActivatedPolicy(activation, context);
           state.enabled = true;
           state.restorationFailed = false;
+          warnInternalUrlRegistryDrift(context);
           persist();
           updateSandboxIndicator(context);
           return;
@@ -1297,6 +1316,7 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
         if (!["use-for-conversation", "save-user-profile", "save-project-profile"].includes(String(saveChoice))) throw errorWithCode("SETUP_CANCELLED", "Sandbox setup was not applied");
         state.restorationFailed = false;
         state.enabled = true;
+        warnInternalUrlRegistryDrift(context);
         state.priorConversationPolicy = false;
         persist();
         updateSandboxIndicator(context);
@@ -1576,6 +1596,7 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
           await resolveActivatedPolicy(activation, context);
           state.enabled = true;
           state.restorationFailed = false;
+          warnInternalUrlRegistryDrift(context);
           if (runtimePolicyMigrationRequired && state.runtimePolicyChanged === true) persist();
           delete state.runtimePolicyChanged;
         } catch (error) {

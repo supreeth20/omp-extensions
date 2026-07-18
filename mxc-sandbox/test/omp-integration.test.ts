@@ -336,6 +336,24 @@ describe("production extension enforcement regressions", () => {
     expect(api.hostRuns).toBe(0);
   });
 
+  test("warns once when the running OMP version drifts from the internal URI registry", async () => {
+    const mod = await loadContract("extension");
+    const factory = requiredExport<ExtensionFactory>(mod, "default");
+    const api = new RecordingApi();
+    (api as unknown as Record<string, unknown>).pi = { VERSION: "18.0.0" };
+    await factory(api, successfulRestoreDependencies);
+    const notices: { message: string; type: string }[] = [];
+    const entries = [{ type: "custom", customType: "mxc-sandbox/state", data: { version: 1, enabled: true, filesystem: { read: [], write: [] } } }];
+    const context = enabledLifecycleContext(entries, { ui: { notify: (message: string, type: string) => notices.push({ message, type }) } });
+    await api.handlers.get("session_start")?.[0]?.({}, context);
+    expect(notices.filter((notice) => notice.type === "warning")).toEqual([
+      expect.objectContaining({ message: expect.stringContaining("OMP 18.0.0 differs from the internal-URL registry verified for OMP 17.0.4") }),
+    ]);
+    await (api.commands.get("sandbox") as Record<string, any>).handler("status", context);
+    expect(notices.some((notice) => notice.message.includes('"synchronizedOmpVersion": "17.0.4"') && notice.message.includes('"drift": true'))).toBe(true);
+    expect(notices.filter((notice) => notice.type === "warning")).toHaveLength(1);
+  });
+
   test("PowerShell outside-once uses only the PowerShell 7 host executor", async () => {
     const mod = await loadContract("extension");
     const factory = requiredExport<ExtensionFactory>(mod, "default");
@@ -1813,6 +1831,26 @@ describe("tool interception and escape flows", () => {
     const result = await intercept({ source: "model", toolName: "write", input: { path: "/repo/a", content: "x" } }, { enabled: true, sandboxPolicy: { write: ["/repo/a"] }, ompApproval: "still-required" });
     expect(result).toEqual({ action: "allow-original-tool", sandboxPolicyApproved: true, ompApproval: "unchanged" });
   });
+  test("delegates passive OMP URIs while gating SSH, Vault, and unknown schemes", async () => {
+    const mod = await loadContract("tools");
+    const intercept = requiredExport<InterceptToolCall>(mod, "interceptToolCall");
+    const context = { enabled: true, sandboxPolicy: { read: [], write: [] } };
+    const internalTargets = [
+      "artifact://A1", "agent://A1", "skill://domain-modeling", "local://context.txt", "memory://key",
+      "rule://policy", "omp://", "issue://1", "pr://1", "history://A1", "mcp://resource",
+      "xd://sandbox_request", "xd://resolve", "xd://reject", "xd://propose",
+    ];
+    for (const path of internalTargets) {
+      expect(await intercept({ source: "model", toolName: "read", input: { path } }, context)).toEqual({ action: "allow-original-tool", sandboxPolicyApproved: true, ompApproval: "unchanged" });
+      expect(await intercept({ source: "model", toolName: "write", input: { path, content: "{}" } }, context)).toEqual({ action: "allow-original-tool", sandboxPolicyApproved: true, ompApproval: "unchanged" });
+    }
+    expect(await intercept({ source: "model", toolName: "read", input: { path: "ssh://user@example.com/a" } }, { ...context, sandboxPolicy: { network: { allowedHosts: [] } } })).toEqual({ block: true, reason: "network-host-not-granted" });
+    expect(await intercept({ source: "model", toolName: "read", input: { path: "ssh://user@example.com/a" } }, { ...context, sandboxPolicy: { network: { allowedHosts: ["example.com"] } } })).toMatchObject({ action: "allow-host-adapter", initialHost: "example.com" });
+    expect(await intercept({ source: "model", toolName: "read", input: { path: "vault://secret" } }, context)).toEqual({ block: true, reason: "vault-access-requires-sandbox-disable" });
+    expect(await intercept({ source: "model", toolName: "write", input: { path: "conflict://C1", content: "resolution" } }, context)).toEqual({ action: "allow-original-tool", sandboxPolicyApproved: true, ompApproval: "unchanged" });
+    expect(await intercept({ source: "model", toolName: "write", input: { path: "vendor://unknown", content: "x" } }, context)).toEqual({ block: true, reason: "unsupported-scheme" });
+  });
+
 
   test("blocks instead of assuming tool_call can mutate input or replace results", async () => {
     const mod = await loadContract("tools");
