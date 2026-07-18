@@ -16,6 +16,7 @@ type CreatePtyBridge = (input: Record<string, any>) => Record<string, any>;
 type FilterRequiredReadonlyPaths = (paths: string[], input: Record<string, string>) => string[];
 type ResolveRequiredReadonlyPaths = (paths: string[], input: Record<string, unknown>) => string[];
 type RuntimeRootForExecutableTarget = (target: string, platform: string) => string | undefined;
+type ResolveExecutionWorkingDirectory = (requested: unknown, currentDirectory?: string, fallbackDirectory?: string) => string;
 type LoadMxcSdk = () => Promise<{ executablePath?: string; reprobePlatformSupport(): Record<string, unknown> }>;
 
 
@@ -607,6 +608,24 @@ describe("native local-network separation probe", () => {
     expect(observedPolicy).toMatchObject({ network: { allowOutbound: false, allowLocalNetwork: true, allowedHosts: ["127.0.0.1"] } });
     await expect(spawnProbe({ ...invocation, policy: { ...invocation.policy, filesystem: { read: [], write: ["/tmp"] } } }, {}, adapter)).rejects.toMatchObject({ code: "INVALID_INTERNAL_TRAFFIC_PROBE" });
   });
+});
+
+test("expands a tilde cwd, recovers a missing implicit cwd, and rejects missing explicit cwd", async () => {
+  const mod = await loadContract("execution");
+  const resolveCwd = requiredExport<ResolveExecutionWorkingDirectory>(mod, "resolveExecutionWorkingDirectory");
+  const missing = join(tmpdir(), `mxc-missing-cwd-${crypto.randomUUID()}`);
+  const home = await mkdtemp(join(tmpdir(), "mxc-test-home-"));
+  try {
+    await mkdir(join(home, "Projects"));
+    expect(resolveCwd("~/Projects", missing, home)).toBe(join(home, "Projects"));
+    expect(resolveCwd(undefined, missing, home)).toBe(home);
+    expect(() => resolveCwd(missing, process.cwd(), home)).toThrow(expect.objectContaining({
+      code: "WORKING_DIRECTORY_UNAVAILABLE",
+      message: `Sandbox working directory does not exist or is not a directory: ${missing}`,
+    }));
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 describe("pipe, PTY, cancellation, and failure lifecycle", () => {

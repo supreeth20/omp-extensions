@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { delimiter, dirname, join, win32 } from "node:path";
+import { homedir } from "node:os";
 import type { ShellLaunch } from "../mxc/config";
 import { buildProcessConfig } from "../mxc/config";
 import { spawnMxcFromInvocation } from "../mxc/sdk";
@@ -38,6 +39,44 @@ export class ExecutionError extends Error {
 function record(value: unknown): UnknownRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? value as UnknownRecord : {};
 }
+export function resolveExecutionWorkingDirectory(
+  requested: unknown,
+  currentDirectory?: string,
+  fallbackDirectory: string = homedir(),
+): string {
+  const explicit = typeof requested === "string";
+  let current = currentDirectory;
+  if (current === undefined) {
+    try {
+      current = process.cwd();
+    } catch {
+      current = undefined;
+    }
+  }
+  const candidate = explicit
+    ? requested === "~"
+      ? fallbackDirectory
+      : requested.startsWith("~/") || requested.startsWith("~\\")
+        ? join(fallbackDirectory, requested.slice(2))
+        : requested
+    : current;
+  try {
+    if (typeof candidate === "string" && candidate.length > 0 && statSync(candidate).isDirectory()) return candidate;
+  } catch {
+    // An implicit session directory can disappear while OMP remains running.
+  }
+  if (explicit) {
+    const resolution = candidate === requested ? "" : ` (resolved to ${String(candidate)})`;
+    throw new ExecutionError("WORKING_DIRECTORY_UNAVAILABLE", `Sandbox working directory does not exist or is not a directory: ${String(requested)}${resolution}`);
+  }
+  try {
+    if (fallbackDirectory.length > 0 && statSync(fallbackDirectory).isDirectory()) return fallbackDirectory;
+  } catch {
+    // Report one deterministic failure below when neither directory is usable.
+  }
+  throw new ExecutionError("WORKING_DIRECTORY_UNAVAILABLE", "Sandbox working directory is unavailable and no usable home-directory fallback exists");
+}
+
 
 function baseName(path: string): string {
   return path.replaceAll("\\", "/").split("/").at(-1)?.toLowerCase() ?? "";
@@ -290,7 +329,9 @@ export async function executeShell(input: UnknownRecord): Promise<UnknownRecord>
       confirmCritical: input.confirmCritical,
     });
   }
-  await confirmCriticalCommand({ shell: input.shell, command: input.command, cwd: input.cwd, confirm: input.confirmCritical });
+  const usesInstalledSpawner = typeof input.spawn !== "function" && typeof input.spawnMxcPty !== "function" && input.mxcAdapter === undefined;
+  const executionCwd = usesInstalledSpawner ? resolveExecutionWorkingDirectory(input.cwd) : input.cwd;
+  await confirmCriticalCommand({ shell: input.shell, command: input.command, cwd: executionCwd, confirm: input.confirmCritical });
   const started = Date.now();
   const shell = resolvedShell(input);
   const runtimePlatform = typeof input.platform === "string" ? input.platform : process.platform;
@@ -331,6 +372,7 @@ export async function executeShell(input: UnknownRecord): Promise<UnknownRecord>
   });
   const config = buildInvocationConfig({
     ...input,
+    cwd: executionCwd,
     platform: runtimePlatform,
     shell,
     policy: executionPolicy,
