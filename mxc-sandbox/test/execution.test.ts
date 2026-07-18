@@ -16,7 +16,7 @@ type CreatePtyBridge = (input: Record<string, any>) => Record<string, any>;
 type FilterRequiredReadonlyPaths = (paths: string[], input: Record<string, string>) => string[];
 type ResolveRequiredReadonlyPaths = (paths: string[], input: Record<string, unknown>) => string[];
 type RuntimeRootForExecutableTarget = (target: string, platform: string) => string | undefined;
-type LoadMxcSdk = () => Promise<{ reprobePlatformSupport(): Record<string, unknown> }>;
+type LoadMxcSdk = () => Promise<{ executablePath?: string; reprobePlatformSupport(): Record<string, unknown> }>;
 
 
 
@@ -153,6 +153,35 @@ describe("per-invocation MXC process configuration", () => {
     expect(config).toMatchObject({ backend: "process", seatbelt: {} });
     expect(config.seatbelt).not.toHaveProperty("guiAccess");
     expect(config.seatbelt).not.toHaveProperty("launchMethod");
+  });
+
+  test("resolves and passes the SDK native launcher without an extension bin link", async () => {
+    const sdkModule = await loadContract("sdk");
+    const resolveExecutable = requiredExport<() => string | undefined>(sdkModule, "resolveInstalledMxcExecutable");
+    const spawn = requiredExport<(input: Record<string, any>, options: Record<string, any>, adapter: Record<string, any>) => Promise<unknown>>(sdkModule, "spawnMxcFromInvocation");
+    const executablePath = resolveExecutable();
+    const executableName = process.platform === "darwin" ? "mxc-exec-mac" : process.platform === "win32" ? "wxc-exec.exe" : "lxc-exec";
+    expect(executablePath).toEndWith(join("node_modules", "@microsoft", "mxc-sdk", "bin", process.arch === "arm64" ? "arm64" : "x64", executableName));
+    expect(executablePath).not.toContain(join("mxc-sandbox", "bin"));
+
+    let observedOptions: Record<string, any> | undefined;
+    await spawn({
+      platform: process.platform,
+      shell: { executable: "/bin/zsh", args: ["-lc"] },
+      command: "printf ok",
+      cwd: "/tmp",
+      env: {},
+      policy: { network: { internet: false, localNetwork: false } },
+      containerId: "mxc-sdk-native-path",
+    }, {}, {
+      version: "0.7.0",
+      schemaVersion: "0.7.0-alpha",
+      schemaVersions: ["0.7.0-alpha"],
+      executablePath,
+      createConfigFromPolicy: async () => ({ process: {} }),
+      spawnSandboxFromConfig: async (_config: unknown, options: Record<string, any>) => { observedOptions = options; return {}; },
+    });
+    expect(observedOptions?.executablePath).toBe(executablePath);
   });
 
   test("serializes Darwin shell argv without expanding process identifiers", async () => {

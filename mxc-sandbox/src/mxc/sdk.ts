@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { accessSync, constants, existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { delimiter, dirname, join, normalize, sep } from "node:path";
 import * as installedMxcSdk from "@microsoft/mxc-sdk";
@@ -17,6 +18,7 @@ export interface MxcSdkAdapter {
   readonly schemaVersion: typeof MXC_SCHEMA_VERSION;
   readonly schemaVersions: readonly [typeof MXC_SCHEMA_VERSION];
   createConfigFromPolicy: CreateConfig;
+  readonly executablePath?: string;
   spawnSandboxFromConfig: SpawnConfig;
   getPlatformSupport(): UnknownRecord;
   reprobePlatformSupport(): UnknownRecord;
@@ -39,6 +41,55 @@ let loadedSdk: Promise<MxcSdkAdapter> | undefined;
 
 function record(value: unknown): UnknownRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? value as UnknownRecord : {};
+}
+function executableName(platform: NodeJS.Platform): string | undefined {
+  if (platform === "darwin") return "mxc-exec-mac";
+  if (platform === "win32") return "wxc-exec.exe";
+  if (platform === "linux") return "lxc-exec";
+  return undefined;
+}
+
+function executableFile(path: string, platform: NodeJS.Platform): boolean {
+  try {
+    if (!statSync(path).isFile()) return false;
+    if (platform !== "win32") accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function resolveInstalledMxcExecutable(
+  platform: NodeJS.Platform = process.platform,
+  architecture: NodeJS.Architecture = process.arch,
+  environment: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const name = executableName(platform);
+  if (!name) return undefined;
+  const sdkArchitecture = architecture === "arm64" ? "arm64" : "x64";
+  const candidates: string[] = [];
+  if (typeof environment.MXC_BIN_DIR === "string" && environment.MXC_BIN_DIR.length > 0) {
+    candidates.push(join(environment.MXC_BIN_DIR, sdkArchitecture, name));
+  }
+  try {
+    const packageJson = createRequire(import.meta.url).resolve("@microsoft/mxc-sdk/package.json");
+    candidates.push(join(dirname(packageJson), "bin", sdkArchitecture, name));
+  } catch {
+    // The normal SDK validation reports a missing dependency if package resolution fails.
+  }
+  return candidates.find((candidate) => executableFile(candidate, platform));
+}
+
+function withInstalledMxcBinDirectory<T>(action: () => T, executablePath: string | undefined): T {
+  if (!executablePath) return action();
+  const prior = process.env.MXC_BIN_DIR;
+  process.env.MXC_BIN_DIR = dirname(dirname(executablePath));
+  try {
+    return action();
+  } finally {
+    if (prior === undefined) delete process.env.MXC_BIN_DIR;
+    else process.env.MXC_BIN_DIR = prior;
+  }
 }
 
 async function sdkVersion(module: UnknownRecord): Promise<string> {
@@ -174,14 +225,19 @@ export async function loadMxcSdk(): Promise<MxcSdkAdapter> {
     if (typeof module.createConfigFromPolicy !== "function" || typeof module.spawnSandboxFromConfig !== "function" || typeof module.getPlatformSupport !== "function" || typeof module.getAvailableToolsPolicy !== "function") {
       throw new MxcSdkError("MXC_SDK_API_UNAVAILABLE", "MXC SDK 0.7.0 createConfigFromPolicy/spawnSandboxFromConfig/getPlatformSupport/getAvailableToolsPolicy APIs are required");
     }
+    const executablePath = resolveInstalledMxcExecutable();
     return {
       version,
       schemaVersion: MXC_SCHEMA_VERSION,
       schemaVersions: [MXC_SCHEMA_VERSION],
+      ...(executablePath ? { executablePath } : {}),
       createConfigFromPolicy: module.createConfigFromPolicy as CreateConfig,
       spawnSandboxFromConfig: module.spawnSandboxFromConfig as SpawnConfig,
-      getPlatformSupport: () => record(installedMxcPlatform.getPlatformSupport()),
-      reprobePlatformSupport: () => {
+      getPlatformSupport: () => withInstalledMxcBinDirectory(
+        () => record(installedMxcPlatform.getPlatformSupport()),
+        executablePath,
+      ),
+      reprobePlatformSupport: () => withInstalledMxcBinDirectory(() => {
         installedMxcPlatform._resetPlatformSupportCache();
         if (process.platform !== "win32") return record(installedMxcPlatform.getPlatformSupport());
         const executable = installedMxcPlatform.findWxcExecutable();
@@ -196,7 +252,7 @@ export async function loadMxcSdk(): Promise<MxcSdkAdapter> {
         } finally {
           installedMxcPlatform._setProbeRunner(null);
         }
-      },
+      }, executablePath),
       discoverRequiredReadonlyPaths: () => {
         const discovered = record((module.getAvailableToolsPolicy as (environment?: NodeJS.ProcessEnv, options?: UnknownRecord) => unknown)(process.env, process.platform === "win32" ? { containerType: "processcontainer" } : undefined));
         const tools = Array.isArray(discovered.readonlyPaths)
@@ -274,7 +330,8 @@ export async function spawnMxcFromInvocation(
   const config = await createSdkInvocationConfig(input, sdk);
   // One-shot MXC ignores AbortSignal. Callers must kill the returned ChildProcess/IPty on cancel or timeout.
   const { signal: _ignoredSignal, ...supportedOptions } = options;
-  return sdk.spawnSandboxFromConfig(config, { ...supportedOptions, usePty: invocation.process.usePty }, invocation.process.cwd);
+  const executablePath = typeof supportedOptions.executablePath === "string" ? undefined : sdk.executablePath;
+  return sdk.spawnSandboxFromConfig(config, { ...supportedOptions, ...(executablePath ? { executablePath } : {}), usePty: invocation.process.usePty }, invocation.process.cwd);
 }
 
 export async function spawnMxcTrafficProbeFromInvocation(
@@ -286,7 +343,8 @@ export async function spawnMxcTrafficProbeFromInvocation(
   const invocation = buildInternalTrafficProbeConfig(input);
   const config = await createSdkInvocationConfig(invocation, sdk);
   const { signal: _ignoredSignal, ...supportedOptions } = options;
-  return sdk.spawnSandboxFromConfig(config, { ...supportedOptions, usePty: false }, invocation.process.cwd);
+  const executablePath = typeof supportedOptions.executablePath === "string" ? undefined : sdk.executablePath;
+  return sdk.spawnSandboxFromConfig(config, { ...supportedOptions, ...(executablePath ? { executablePath } : {}), usePty: false }, invocation.process.cwd);
 }
 
 export function clearMxcSdkCacheForReprobe(): void {

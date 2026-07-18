@@ -24,8 +24,9 @@ async function linkDirectory(target: string, link: string): Promise<void> {
   await symlink(source, link, process.platform === "win32" ? "junction" : "dir");
 }
 
-await linkDirectory(join(extensionRoot, "node_modules", "@microsoft", "mxc-sdk", "bin"), join(extensionRoot, "bin"));
+const sdkBinDirectory = join(extensionRoot, "node_modules", "@microsoft", "mxc-sdk", "bin");
+await rm(join(extensionRoot, "bin"), { recursive: true, force: true });
 const sdkArchitecture = process.arch === "arm64" ? "arm64" : "x64";
 const nativeLauncher = process.platform === "darwin" ? "mxc-exec-mac" : process.platform === "win32" ? "wxc-exec.exe" : "lxc-exec";
-await access(join(extensionRoot, "bin", sdkArchitecture, nativeLauncher), constants.X_OK);
+await access(join(sdkBinDirectory, sdkArchitecture, nativeLauncher), constants.X_OK);
 await linkDirectory(join(extensionRoot, "node_modules", "node-pty", "prebuilds"), join(outputDirectory, "prebuilds"));
