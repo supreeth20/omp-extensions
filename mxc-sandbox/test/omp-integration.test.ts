@@ -438,6 +438,36 @@ describe("production extension enforcement regressions", () => {
     expect(updates.at(-1)).toEqual({ content: [{ type: "text", text: "outside first\noutside second\n" }], details: undefined });
   });
 
+  test("Bash outside-once expands a tilde cwd for direct and launch-failure host execution", async () => {
+    const mod = await loadContract("extension");
+    const factory = requiredExport<ExtensionFactory>(mod, "default");
+    const api = new RecordingApi();
+    const home = await mkdtemp(join(tmpdir(), "mxc-outside-home-"));
+    try {
+      const projects = join(home, "Projects");
+      await mkdir(projects);
+      await factory(api, { ...successfulRestoreDependencies, platform: "darwin", homeDirectory: home });
+      const lifecycleContext = enabledLifecycleContext([
+        { type: "custom", customType: "mxc-sandbox/state", data: { version: 1, enabled: true, filesystem: { read: [], write: [] } } },
+      ], { onShellUpdate: undefined, ui: { confirm: async () => true } });
+      await api.handlers.get("session_start")?.[0]?.({}, lifecycleContext);
+      const bash = api.tools.get("bash") as Record<string, any>;
+
+      await bash.execute({ outsideSandbox: true, command: "printf direct", cwd: "~/Projects" }, lifecycleContext);
+      expect((api.execCalls[0]?.[2] as Record<string, unknown>).cwd).toBe(projects);
+
+      await bash.execute({
+        command: "printf fallback",
+        cwd: "~/Projects",
+        spawn: async () => { throw new Error("MXC launch failed"); },
+      }, { ...lifecycleContext, ui: { confirm: async () => true, select: async () => "Run this command outside once" } });
+      expect((api.execCalls[1]?.[2] as Record<string, unknown>).cwd).toBe(projects);
+      expect(api.hostRuns).toBe(2);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   test("Bash outside-once streams before host completion on macOS and Linux", async () => {
     const mod = await loadContract("extension");
     const factory = requiredExport<ExtensionFactory>(mod, "default");

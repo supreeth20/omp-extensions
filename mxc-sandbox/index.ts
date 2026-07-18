@@ -13,7 +13,7 @@ import { buildSandboxEnvironment } from "./src/policy/environment";
 import { resolveNetworkPolicy } from "./src/policy/network";
 import { loadProfileLayers, mergePolicyLayers } from "./src/profiles";
 import { activateSandbox, ActivationError, probePublicOmpRuntime } from "./src/runtime/features";
-import { createContainerId, executeShell, resolveShell } from "./src/runtime/process";
+import { createContainerId, executeShell, expandExecutionWorkingDirectory, resolveShell } from "./src/runtime/process";
 import type { StateRecord } from "./src/state";
 import { handleSessionLifecycle, ProcessSensitiveApprovalStore, serializeState, snapshotBranchState } from "./src/state";
 import { createDashboardPresentation, discoveredReadonlyGrants, getInitialSetupDefaults, createDashboardModel, createReenableModel, requireInteractiveUi, runSandboxDashboard } from "./src/ui";
@@ -1010,6 +1010,7 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
     context: Record<string, unknown>,
     onUpdate?: (update: Record<string, unknown>) => void,
   ): Promise<unknown> => {
+    const hostInput: Record<string, unknown> = { ...input, cwd: expandExecutionWorkingDirectory(input.cwd, profileHome) };
     if (typeof api.exec !== "function") throw errorWithCode("HOST_EXECUTOR_UNAVAILABLE", "OMP exec is unavailable");
     if (shell === "powershell" && runtimePlatform !== "win32") throw errorWithCode("POWERSHELL_7_REQUIRED", "PowerShell host execution requires Windows and PowerShell 7");
     const resolved = resolveShell({
@@ -1019,20 +1020,20 @@ export default function mxcSandboxExtension(api: ExtensionApi, dependencies: Ext
       discovered: context.discoveredExecutables,
     });
     if (typeof onUpdate === "function") {
-      return (dependencies.spawnHost ?? executeStreamingHostProcess)(resolved.executable, [...resolved.args, String(input.command ?? "")], { ...input, signal: context.signal }, onUpdate);
+      return (dependencies.spawnHost ?? executeStreamingHostProcess)(resolved.executable, [...resolved.args, String(hostInput.command ?? "")], { ...hostInput, signal: context.signal }, onUpdate);
     }
     if (shell === "powershell") {
       const timeoutMs = typeof input.timeout === "number" && Number.isFinite(input.timeout) && input.timeout > 0 ? input.timeout * 1000 : undefined;
-      const options = { cwd: input.cwd, env: input.env, ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }) };
-      const result = await (api.exec as (...arguments_: unknown[]) => unknown)(resolved.executable, [...resolved.args, String(input.command ?? "")], options);
+      const options = { cwd: hostInput.cwd, env: hostInput.env, ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }) };
+      const result = await (api.exec as (...arguments_: unknown[]) => unknown)(resolved.executable, [...resolved.args, String(hostInput.command ?? "")], options);
       return normalizeHostExecResult(recordValue(result));
     }
     const options = {
-      cwd: input.cwd,
-      env: input.env,
+      cwd: hostInput.cwd,
+      env: hostInput.env,
       ...(typeof input.timeout === "number" ? { timeout: input.timeout } : {}),
     };
-    return (api.exec as (...arguments_: unknown[]) => unknown)(resolved.executable, [...resolved.args, String(input.command ?? "")], options);
+    return (api.exec as (...arguments_: unknown[]) => unknown)(resolved.executable, [...resolved.args, String(hostInput.command ?? "")], options);
   };
 
   const runShell = async (shell: "bash" | "powershell", invocation: { actual: boolean; input: Record<string, unknown>; context: Record<string, unknown> }, derived?: { policy: Record<string, unknown>; sensitiveApprovedNames: string[] }): Promise<unknown> => {

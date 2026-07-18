@@ -39,6 +39,14 @@ export class ExecutionError extends Error {
 function record(value: unknown): UnknownRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? value as UnknownRecord : {};
 }
+export function expandExecutionWorkingDirectory(requested: unknown, homeDirectory: string = homedir()): unknown {
+  if (requested === "~") return homeDirectory;
+  if (typeof requested === "string" && (requested.startsWith("~/") || requested.startsWith("~\\"))) {
+    return join(homeDirectory, requested.slice(2));
+  }
+  return requested;
+}
+
 export function resolveExecutionWorkingDirectory(
   requested: unknown,
   currentDirectory?: string,
@@ -53,13 +61,7 @@ export function resolveExecutionWorkingDirectory(
       current = undefined;
     }
   }
-  const candidate = explicit
-    ? requested === "~"
-      ? fallbackDirectory
-      : requested.startsWith("~/") || requested.startsWith("~\\")
-        ? join(fallbackDirectory, requested.slice(2))
-        : requested
-    : current;
+  const candidate = explicit ? expandExecutionWorkingDirectory(requested, fallbackDirectory) : current;
   try {
     if (typeof candidate === "string" && candidate.length > 0 && statSync(candidate).isDirectory()) return candidate;
   } catch {
